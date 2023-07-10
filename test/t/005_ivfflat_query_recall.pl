@@ -18,24 +18,21 @@ $node->safe_psql("postgres",
 
 # Check each index type
 my @operators = ("<->", "<#>", "<=>");
-foreach (@operators) {
-	my $operator = $_;
+my @opclasses = ("vector_l2_ops", "vector_ip_ops", "vector_cosine_ops");
+
+for my $i (0 .. $#operators)
+{
+	my $operator = $operators[$i];
+	my $opclass = $opclasses[$i];
 
 	# Add index
-	my $opclass;
-	if ($operator eq "<->") {
-		$opclass = "vector_l2_ops";
-	} elsif ($operator eq "<#>") {
-		$opclass = "vector_ip_ops";
-	} else {
-		$opclass = "vector_cosine_ops";
-	}
 	$node->safe_psql("postgres", "CREATE INDEX ON tst USING ivfflat (v $opclass);");
 
 	# Test 100% recall
-	for (1..20) {
-		my $i = int(rand() * 100000);
-		my $query = $node->safe_psql("postgres", "SELECT v FROM tst WHERE i = $i;");
+	for (1 .. 20)
+	{
+		my $id = int(rand() * 100000);
+		my $query = $node->safe_psql("postgres", "SELECT v FROM tst WHERE i = $id;");
 		my $res = $node->safe_psql("postgres", qq(
 			SET enable_seqscan = off;
 			SELECT v FROM tst ORDER BY v <-> '$query' LIMIT 1;

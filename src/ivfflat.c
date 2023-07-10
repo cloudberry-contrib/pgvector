@@ -20,11 +20,11 @@ static relopt_kind ivfflat_relopt_kind;
  * Initialize index options and variables
  */
 void
-_PG_init(void)
+IvfflatInit(void)
 {
 	ivfflat_relopt_kind = add_reloption_kind();
 	add_int_reloption(ivfflat_relopt_kind, "lists", "Number of inverted lists",
-					  IVFFLAT_DEFAULT_LISTS, 1, IVFFLAT_MAX_LISTS
+					  IVFFLAT_DEFAULT_LISTS, IVFFLAT_MIN_LISTS, IVFFLAT_MAX_LISTS
 #if PG_VERSION_NUM >= 130000
 					  ,AccessExclusiveLock
 #endif
@@ -32,7 +32,7 @@ _PG_init(void)
 
 	DefineCustomIntVariable("ivfflat.probes", "Sets the number of probes",
 							"Valid range is 1..lists.", &ivfflat_probes,
-							1, 1, IVFFLAT_MAX_LISTS, PGC_USERSET, 0, NULL, NULL, NULL);
+							IVFFLAT_DEFAULT_PROBES, IVFFLAT_MIN_LISTS, IVFFLAT_MAX_LISTS, PGC_USERSET, 0, NULL, NULL, NULL);
 }
 
 /*
@@ -48,8 +48,8 @@ ivfflatbuildphasename(int64 phasenum)
 			return "initializing";
 		case PROGRESS_IVFFLAT_PHASE_KMEANS:
 			return "performing k-means";
-		case PROGRESS_IVFFLAT_PHASE_SORT:
-			return "sorting tuples";
+		case PROGRESS_IVFFLAT_PHASE_ASSIGN:
+			return "assigning tuples";
 		case PROGRESS_IVFFLAT_PHASE_LOAD:
 			return "loading tuples";
 		default:
@@ -71,7 +71,7 @@ ivfflatcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	int			lists;
 	double		ratio;
 	double		spc_seq_page_cost;
-	Relation	indexRel;
+	Relation	index;
 #if PG_VERSION_NUM < 120000
 	List	   *qinfos;
 #endif
@@ -89,9 +89,9 @@ ivfflatcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	MemSet(&costs, 0, sizeof(costs));
 
-	indexRel = index_open(path->indexinfo->indexoid, NoLock);
-	lists = IvfflatGetLists(indexRel);
-	index_close(indexRel, NoLock);
+	index = index_open(path->indexinfo->indexoid, NoLock);
+	IvfflatGetMetaPageInfo(index, &lists, NULL);
+	index_close(index, NoLock);
 
 	/* Get the ratio of lists that we need to visit */
 	ratio = ((double) ivfflat_probes) / lists;
