@@ -3,6 +3,7 @@
 #include <float.h>
 
 #include "catalog/index.h"
+#include "cdb/cdbvars.h"
 #include "ivfflat.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -430,7 +431,7 @@ ComputeCenters(IvfflatBuildState * buildstate)
 	/* Sample rows */
 	/* TODO Ensure within maintenance_work_mem */
 	buildstate->samples = VectorArrayInit(numSamples, buildstate->dimensions);
-	if (buildstate->heap != NULL)
+	if (buildstate->heap != NULL && Gp_role != GP_ROLE_DISPATCH)
 	{
 		SampleRows(buildstate);
 
