@@ -2,9 +2,7 @@ SET enable_seqscan = off;
 
 CREATE TABLE t (val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
--- start_ignore
-CREATE INDEX ON t USING ivfflat (val vector_cosine_ops) WITH (lists = 1);
--- end_ignore
+CREATE INDEX ON t USING hnsw (val vector_cosine_ops);
 
 INSERT INTO t (val) VALUES ('[1,2,4]');
 

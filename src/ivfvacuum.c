@@ -1,6 +1,5 @@
 #include "postgres.h"
 
-#include "access/generic_xlog.h"
 #include "commands/vacuum.h"
 #include "ivfflat.h"
 #include "storage/bufmgr.h"
@@ -26,7 +25,7 @@ ivfflatbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		Page		cpage;
 		OffsetNumber coffno;
 		OffsetNumber cmaxoffno;
-		BlockNumber listPages[MaxOffsetNumber];
+		BlockNumber startPages[MaxOffsetNumber];
 		ListInfo	listInfo;
 
 		cbuf = ReadBuffer(index, blkno);
@@ -40,7 +39,7 @@ ivfflatbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		{
 			IvfflatList list = (IvfflatList) PageGetItem(cpage, PageGetItemId(cpage, coffno));
 
-			listPages[coffno - FirstOffsetNumber] = list->startPage;
+			startPages[coffno - FirstOffsetNumber] = list->startPage;
 		}
 
 		listInfo.blkno = blkno;
@@ -50,7 +49,7 @@ ivfflatbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 
 		for (coffno = FirstOffsetNumber; coffno <= cmaxoffno; coffno = OffsetNumberNext(coffno))
 		{
-			BlockNumber searchPage = listPages[coffno - FirstOffsetNumber];
+			BlockNumber searchPage = startPages[coffno - FirstOffsetNumber];
 			BlockNumber insertPage = InvalidBlockNumber;
 
 			/* Iterate over entry pages */

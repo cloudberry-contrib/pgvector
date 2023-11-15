@@ -1,11 +1,11 @@
 use strict;
-use warnings FATAL => 'all';
-use PostgreSQL::Test::Cluster;
-use PostgreSQL::Test::Utils;
+use warnings;
+use PostgresNode;
+use TestLib;
 use Test::More;
 
 # Initialize node
-my $node = PostgreSQL::Test::Cluster->new('node');
+my $node = get_new_node('node');
 $node->init;
 $node->start;
 

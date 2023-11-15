@@ -1,13 +1,9 @@
 SET enable_seqscan = off;
-SET optimizer = off;
 CREATE TABLE t (val vector(3));
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 -- start_ignore
 CREATE INDEX ON t USING ivfflat (val vector_ip_ops) WITH (lists = 1);
-NOTICE:  ivfflat index created with little data  (seg1 127.0.1.1:7003 pid=424029)
-DETAIL:  This will cause low recall.
-HINT:  Drop the index until the table has more data.
 -- end_ignore
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <#> '[3,3,3]';
@@ -19,9 +15,10 @@ SELECT * FROM t ORDER BY val <#> '[3,3,3]';
  [0,0,0]
 (4 rows)
 
-SELECT * FROM t ORDER BY val <#> (SELECT NULL::vector);
- val 
------
-(0 rows)
+SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <#> (SELECT NULL::vector)) t2;
+ count 
+-------
+     4
+(1 row)
 
 DROP TABLE t;

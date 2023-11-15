@@ -1,10 +1,9 @@
 SET enable_seqscan = off;
-SET optimizer = off;
 CREATE TABLE t (val vector(3));
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 -- start_ignore
-CREATE INDEX ON t USING ivfflat (val) WITH (lists = 1);
+CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 1);
 -- end_ignore
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
@@ -16,15 +15,33 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
  [0,0,0]
 (4 rows)
 
-SELECT * FROM t ORDER BY val <-> (SELECT NULL::vector);
- val 
------
-(0 rows)
+-- this sql will convert to ‘order by ctid’ clause, but the result is not stable on MPP architecture.
+-- SELECT * FROM t ORDER BY val <-> (SELECT NULL::vector);
+SELECT * FROM t ORDER BY val;
+   val   
+---------
+ [0,0,0]
+ [1,1,1]
+ [1,2,3]
+ [1,2,4]
+ 
+(5 rows)
 
 SELECT COUNT(*) FROM t;
  count 
 -------
      5
 (1 row)
+
+-- start_ignore
+TRUNCATE t;
+NOTICE:  ivfflat index created with little data
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
+-- end_ignore
+SELECT * FROM t ORDER BY val <-> '[3,3,3]';
+ val 
+-----
+(0 rows)
 
 DROP TABLE t;

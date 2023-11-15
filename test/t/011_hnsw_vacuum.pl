@@ -1,7 +1,7 @@
 use strict;
-use warnings FATAL => 'all';
-use PostgreSQL::Test::Cluster;
-use PostgreSQL::Test::Utils;
+use warnings;
+use PostgresNode;
+use TestLib;
 use Test::More;
 
 my $dim = 3;
@@ -15,7 +15,7 @@ for (1 .. $dim)
 my $array_sql = join(", ", @r);
 
 # Initialize node
-my $node = PostgreSQL::Test::Cluster->new('node');
+my $node = get_new_node('node');
 $node->init;
 $node->start;
 
