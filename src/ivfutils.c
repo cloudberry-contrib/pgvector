@@ -35,9 +35,7 @@ VectorArrayFree(VectorArray arr)
 void
 PrintVectorArray(char *msg, VectorArray arr)
 {
-	int			i;
-
-	for (i = 0; i < arr->length; i++)
+	for (int i = 0; i < arr->length; i++)
 		PrintVector(msg, VectorArrayGet(arr, i));
 }
 
@@ -59,12 +57,12 @@ IvfflatGetLists(Relation index)
  * Get proc
  */
 FmgrInfo *
-IvfflatOptionalProcInfo(Relation rel, uint16 procnum)
+IvfflatOptionalProcInfo(Relation index, uint16 procnum)
 {
-	if (!OidIsValid(index_getprocid(rel, 1, procnum)))
+	if (!OidIsValid(index_getprocid(index, 1, procnum)))
 		return NULL;
 
-	return index_getprocinfo(rel, 1, procnum);
+	return index_getprocinfo(index, 1, procnum);
 }
 
 /*
@@ -78,20 +76,16 @@ IvfflatOptionalProcInfo(Relation rel, uint16 procnum)
 bool
 IvfflatNormValue(FmgrInfo *procinfo, Oid collation, Datum *value, Vector * result)
 {
-	Vector	   *v;
-	int			i;
-	double		norm;
-
-	norm = DatumGetFloat8(FunctionCall1Coll(procinfo, collation, *value));
+	double		norm = DatumGetFloat8(FunctionCall1Coll(procinfo, collation, *value));
 
 	if (norm > 0)
 	{
-		v = DatumGetVector(*value);
+		Vector	   *v = DatumGetVector(*value);
 
 		if (result == NULL)
 			result = InitVector(v->dim);
 
-		for (i = 0; i < v->dim; i++)
+		for (int i = 0; i < v->dim; i++)
 			result->x[i] = v->x[i] / norm;
 
 		*value = PointerGetDatum(result);
@@ -142,7 +136,6 @@ IvfflatInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogStat
 void
 IvfflatCommitBuffer(Buffer buf, GenericXLogState *state)
 {
-	MarkBufferDirty(buf);
 	GenericXLogFinish(state);
 	UnlockReleaseBuffer(buf);
 }
@@ -166,8 +159,6 @@ IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **st
 	IvfflatInitPage(newbuf, newpage);
 
 	/* Commit */
-	MarkBufferDirty(*buf);
-	MarkBufferDirty(newbuf);
 	GenericXLogFinish(*state);
 
 	/* Unlock */
@@ -179,15 +170,39 @@ IvfflatAppendPage(Relation index, Buffer *buf, Page *page, GenericXLogState **st
 }
 
 /*
+ * Get the metapage info
+ */
+void
+IvfflatGetMetaPageInfo(Relation index, int *lists, int *dimensions)
+{
+	Buffer		buf;
+	Page		page;
+	IvfflatMetaPage metap;
+
+	buf = ReadBuffer(index, IVFFLAT_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	metap = IvfflatPageGetMeta(page);
+
+	*lists = metap->lists;
+
+	if (dimensions != NULL)
+		*dimensions = metap->dimensions;
+
+	UnlockReleaseBuffer(buf);
+}
+
+/*
  * Update the start or insert page of a list
  */
 void
-IvfflatUpdateList(Relation index, GenericXLogState *state, ListInfo listInfo,
+IvfflatUpdateList(Relation index, ListInfo listInfo,
 				  BlockNumber insertPage, BlockNumber originalInsertPage,
 				  BlockNumber startPage, ForkNumber forkNum)
 {
 	Buffer		buf;
 	Page		page;
+	GenericXLogState *state;
 	IvfflatList list;
 	bool		changed = false;
 

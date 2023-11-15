@@ -29,7 +29,7 @@ SELECT ARRAY[1,2,3]::numeric[]::vector;
 (1 row)
 
 SELECT '{NULL}'::real[]::vector;
-ERROR:  array must not containing NULLs
+ERROR:  array must not contain nulls
 SELECT '{NaN}'::real[]::vector;
 ERROR:  NaN not allowed in vector
 SELECT '{Infinity}'::real[]::vector;
@@ -38,6 +38,8 @@ SELECT '{-Infinity}'::real[]::vector;
 ERROR:  infinite value not allowed in vector
 SELECT '{}'::real[]::vector;
 ERROR:  vector must have at least 1 dimension
+SELECT '{{1}}'::real[]::vector;
+ERROR:  array must be 1-D
 SELECT '[1,2,3]'::vector::real[];
  float4  
 ---------

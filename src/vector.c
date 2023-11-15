@@ -2,15 +2,22 @@
 
 #include <math.h>
 
-#include "vector.h"
-#include "fmgr.h"
 #include "catalog/pg_type.h"
+#include "fmgr.h"
+#include "hnsw.h"
+#include "ivfflat.h"
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
+#include "port.h"				/* for strtof() */
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
+#include "vector.h"
+
+#if PG_VERSION_NUM >= 160000
+#include "varatt.h"
+#endif
 
 #if PG_VERSION_NUM >= 120000
 #include "common/shortest_dec.h"
@@ -28,6 +35,17 @@
 #define CreateStateDatums(dim) palloc(sizeof(Datum) * (dim + 1))
 
 PG_MODULE_MAGIC;
+
+/*
+ * Initialize index options and variables
+ */
+PGDLLEXPORT void _PG_init(void);
+void
+_PG_init(void)
+{
+	HnswInit();
+	IvfflatInit();
+}
 
 /*
  * Ensure same dimensions
@@ -88,6 +106,23 @@ CheckElement(float value)
 }
 
 /*
+ * Allocate and initialize a new vector
+ */
+Vector *
+InitVector(int dim)
+{
+	Vector	   *result;
+	int			size;
+
+	size = VECTOR_SIZE(dim);
+	result = (Vector *) palloc0(size);
+	SET_VARSIZE(result, size);
+	result->dim = dim;
+
+	return result;
+}
+
+/*
  * Check for whitespace, since array_isspace() is static
  */
 static inline bool
@@ -125,6 +160,14 @@ float_overflow_error(void)
 			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
 			 errmsg("value out of range: overflow")));
 }
+
+static pg_noinline void
+float_underflow_error(void)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+			 errmsg("value out of range: underflow")));
+}
 #endif
 
 /*
@@ -136,7 +179,6 @@ vector_in(PG_FUNCTION_ARGS)
 {
 	char	   *str = PG_GETARG_CSTRING(0);
 	int32		typmod = PG_GETARG_INT32(2);
-	int			i;
 	float		x[VECTOR_MAX_DIM];
 	int			dim = 0;
 	char	   *pt;
@@ -231,7 +273,7 @@ vector_in(PG_FUNCTION_ARGS)
 	CheckExpectedDim(typmod, dim);
 
 	result = InitVector(dim);
-	for (i = 0; i < dim; i++)
+	for (int i = 0; i < dim; i++)
 		result->x[i] = x[i];
 
 	PG_RETURN_POINTER(result);
@@ -248,7 +290,6 @@ vector_out(PG_FUNCTION_ARGS)
 	int			dim = vector->dim;
 	char	   *buf;
 	char	   *ptr;
-	int			i;
 	int			n;
 
 #if PG_VERSION_NUM < 120000
@@ -275,7 +316,7 @@ vector_out(PG_FUNCTION_ARGS)
 
 	*ptr = '[';
 	ptr++;
-	for (i = 0; i < dim; i++)
+	for (int i = 0; i < dim; i++)
 	{
 		if (i > 0)
 		{
@@ -353,7 +394,6 @@ vector_recv(PG_FUNCTION_ARGS)
 	Vector	   *result;
 	int16		dim;
 	int16		unused;
-	int			i;
 
 	dim = pq_getmsgint(buf, sizeof(int16));
 	unused = pq_getmsgint(buf, sizeof(int16));
@@ -367,7 +407,7 @@ vector_recv(PG_FUNCTION_ARGS)
 				 errmsg("expected unused to be 0, not %d", unused)));
 
 	result = InitVector(dim);
-	for (i = 0; i < dim; i++)
+	for (int i = 0; i < dim; i++)
 	{
 		result->x[i] = pq_getmsgfloat4(buf);
 		CheckElement(result->x[i]);
@@ -385,12 +425,11 @@ vector_send(PG_FUNCTION_ARGS)
 {
 	Vector	   *vec = PG_GETARG_VECTOR_P(0);
 	StringInfoData buf;
-	int			i;
 
 	pq_begintypsend(&buf);
 	pq_sendint(&buf, vec->dim, sizeof(int16));
 	pq_sendint(&buf, vec->unused, sizeof(int16));
-	for (i = 0; i < vec->dim; i++)
+	for (int i = 0; i < vec->dim; i++)
 		pq_sendfloat4(&buf, vec->x[i]);
 
 	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
@@ -420,7 +459,6 @@ array_to_vector(PG_FUNCTION_ARGS)
 {
 	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
 	int32		typmod = PG_GETARG_INT32(1);
-	int			i;
 	Vector	   *result;
 	int16		typlen;
 	bool		typbyval;
@@ -434,6 +472,11 @@ array_to_vector(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DATA_EXCEPTION),
 				 errmsg("array must be 1-D")));
 
+	if (ARR_HASNULL(array) && array_contains_nulls(array))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("array must not contain nulls")));
+
 	get_typlenbyvalalign(ARR_ELEMTYPE(array), &typlen, &typbyval, &typalign);
 	deconstruct_array(array, ARR_ELEMTYPE(array), typlen, typbyval, typalign, &elemsp, &nullsp, &nelemsp);
 
@@ -441,29 +484,37 @@ array_to_vector(PG_FUNCTION_ARGS)
 	CheckExpectedDim(typmod, nelemsp);
 
 	result = InitVector(nelemsp);
-	for (i = 0; i < nelemsp; i++)
+
+	if (ARR_ELEMTYPE(array) == INT4OID)
 	{
-		if (nullsp[i])
-			ereport(ERROR,
-					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
-					 errmsg("array must not containing NULLs")));
-
-		/* TODO Move outside loop in 0.5.0 */
-		if (ARR_ELEMTYPE(array) == INT4OID)
+		for (int i = 0; i < nelemsp; i++)
 			result->x[i] = DatumGetInt32(elemsp[i]);
-		else if (ARR_ELEMTYPE(array) == FLOAT8OID)
-			result->x[i] = DatumGetFloat8(elemsp[i]);
-		else if (ARR_ELEMTYPE(array) == FLOAT4OID)
-			result->x[i] = DatumGetFloat4(elemsp[i]);
-		else if (ARR_ELEMTYPE(array) == NUMERICOID)
-			result->x[i] = DatumGetFloat4(DirectFunctionCall1(numeric_float4, elemsp[i]));
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_EXCEPTION),
-					 errmsg("unsupported array type")));
-
-		CheckElement(result->x[i]);
 	}
+	else if (ARR_ELEMTYPE(array) == FLOAT8OID)
+	{
+		for (int i = 0; i < nelemsp; i++)
+			result->x[i] = DatumGetFloat8(elemsp[i]);
+	}
+	else if (ARR_ELEMTYPE(array) == FLOAT4OID)
+	{
+		for (int i = 0; i < nelemsp; i++)
+			result->x[i] = DatumGetFloat4(elemsp[i]);
+	}
+	else if (ARR_ELEMTYPE(array) == NUMERICOID)
+	{
+		for (int i = 0; i < nelemsp; i++)
+			result->x[i] = DatumGetFloat4(DirectFunctionCall1(numeric_float4, elemsp[i]));
+	}
+	else
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_EXCEPTION),
+				 errmsg("unsupported array type")));
+	}
+
+	/* Check elements */
+	for (int i = 0; i < result->dim; i++)
+		CheckElement(result->x[i]);
 
 	PG_RETURN_POINTER(result);
 }
@@ -478,11 +529,10 @@ vector_to_float4(PG_FUNCTION_ARGS)
 	Vector	   *vec = PG_GETARG_VECTOR_P(0);
 	Datum	   *datums;
 	ArrayType  *result;
-	int			i;
 
 	datums = (Datum *) palloc(sizeof(Datum) * vec->dim);
 
-	for (i = 0; i < vec->dim; i++)
+	for (int i = 0; i < vec->dim; i++)
 		datums[i] = Float4GetDatum(vec->x[i]);
 
 	/* Use TYPALIGN_INT for float4 */
@@ -504,8 +554,8 @@ l2_distance(PG_FUNCTION_ARGS)
 	Vector	   *b = PG_GETARG_VECTOR_P(1);
 	float	   *ax = a->x;
 	float	   *bx = b->x;
-	double		distance = 0.0;
-	double		diff;
+	float		distance = 0.0;
+	float		diff;
 
 	CheckDims(a, b);
 
@@ -516,7 +566,7 @@ l2_distance(PG_FUNCTION_ARGS)
 		distance += diff * diff;
 	}
 
-	PG_RETURN_FLOAT8(sqrt(distance));
+	PG_RETURN_FLOAT8(sqrt((double) distance));
 }
 
 /*
@@ -531,8 +581,8 @@ vector_l2_squared_distance(PG_FUNCTION_ARGS)
 	Vector	   *b = PG_GETARG_VECTOR_P(1);
 	float	   *ax = a->x;
 	float	   *bx = b->x;
-	double		distance = 0.0;
-	double		diff;
+	float		distance = 0.0;
+	float		diff;
 
 	CheckDims(a, b);
 
@@ -543,7 +593,7 @@ vector_l2_squared_distance(PG_FUNCTION_ARGS)
 		distance += diff * diff;
 	}
 
-	PG_RETURN_FLOAT8(distance);
+	PG_RETURN_FLOAT8((double) distance);
 }
 
 /*
@@ -557,7 +607,7 @@ inner_product(PG_FUNCTION_ARGS)
 	Vector	   *b = PG_GETARG_VECTOR_P(1);
 	float	   *ax = a->x;
 	float	   *bx = b->x;
-	double		distance = 0.0;
+	float		distance = 0.0;
 
 	CheckDims(a, b);
 
@@ -565,7 +615,7 @@ inner_product(PG_FUNCTION_ARGS)
 	for (int i = 0; i < a->dim; i++)
 		distance += ax[i] * bx[i];
 
-	PG_RETURN_FLOAT8(distance);
+	PG_RETURN_FLOAT8((double) distance);
 }
 
 /*
@@ -579,7 +629,7 @@ vector_negative_inner_product(PG_FUNCTION_ARGS)
 	Vector	   *b = PG_GETARG_VECTOR_P(1);
 	float	   *ax = a->x;
 	float	   *bx = b->x;
-	double		distance = 0.0;
+	float		distance = 0.0;
 
 	CheckDims(a, b);
 
@@ -587,7 +637,7 @@ vector_negative_inner_product(PG_FUNCTION_ARGS)
 	for (int i = 0; i < a->dim; i++)
 		distance += ax[i] * bx[i];
 
-	PG_RETURN_FLOAT8(distance * -1);
+	PG_RETURN_FLOAT8((double) distance * -1);
 }
 
 /*
@@ -601,9 +651,10 @@ cosine_distance(PG_FUNCTION_ARGS)
 	Vector	   *b = PG_GETARG_VECTOR_P(1);
 	float	   *ax = a->x;
 	float	   *bx = b->x;
-	double		distance = 0.0;
-	double		norma = 0.0;
-	double		normb = 0.0;
+	float		distance = 0.0;
+	float		norma = 0.0;
+	float		normb = 0.0;
+	double		similarity;
 
 	CheckDims(a, b);
 
@@ -616,7 +667,21 @@ cosine_distance(PG_FUNCTION_ARGS)
 	}
 
 	/* Use sqrt(a * b) over sqrt(a) * sqrt(b) */
-	PG_RETURN_FLOAT8(1 - (distance / sqrt(norma * normb)));
+	similarity = (double) distance / sqrt((double) norma * (double) normb);
+
+#ifdef _MSC_VER
+	/* /fp:fast may not propagate NaN */
+	if (isnan(similarity))
+		PG_RETURN_FLOAT8(NAN);
+#endif
+
+	/* Keep in range */
+	if (similarity > 1)
+		similarity = 1.0;
+	else if (similarity < -1)
+		similarity = -1.0;
+
+	PG_RETURN_FLOAT8(1.0 - similarity);
 }
 
 /*
@@ -630,13 +695,18 @@ vector_spherical_distance(PG_FUNCTION_ARGS)
 {
 	Vector	   *a = PG_GETARG_VECTOR_P(0);
 	Vector	   *b = PG_GETARG_VECTOR_P(1);
-	double		distance = 0.0;
+	float	   *ax = a->x;
+	float	   *bx = b->x;
+	float		dp = 0.0;
+	double		distance;
 
 	CheckDims(a, b);
 
 	/* Auto-vectorized */
 	for (int i = 0; i < a->dim; i++)
-		distance += a->x[i] * b->x[i];
+		dp += ax[i] * bx[i];
+
+	distance = (double) dp;
 
 	/* Prevent NaN with acos with loss of precision */
 	if (distance > 1)
@@ -645,6 +715,28 @@ vector_spherical_distance(PG_FUNCTION_ARGS)
 		distance = -1;
 
 	PG_RETURN_FLOAT8(acos(distance) / M_PI);
+}
+
+/*
+ * Get the L1 distance between vectors
+ */
+PGDLLEXPORT PG_FUNCTION_INFO_V1(l1_distance);
+Datum
+l1_distance(PG_FUNCTION_ARGS)
+{
+	Vector	   *a = PG_GETARG_VECTOR_P(0);
+	Vector	   *b = PG_GETARG_VECTOR_P(1);
+	float	   *ax = a->x;
+	float	   *bx = b->x;
+	float		distance = 0.0;
+
+	CheckDims(a, b);
+
+	/* Auto-vectorized */
+	for (int i = 0; i < a->dim; i++)
+		distance += fabsf(ax[i] - bx[i]);
+
+	PG_RETURN_FLOAT8((double) distance);
 }
 
 /*
@@ -672,7 +764,7 @@ vector_norm(PG_FUNCTION_ARGS)
 
 	/* Auto-vectorized */
 	for (int i = 0; i < a->dim; i++)
-		norm += ax[i] * ax[i];
+		norm += (double) ax[i] * (double) ax[i];
 
 	PG_RETURN_FLOAT8(sqrt(norm));
 }
@@ -744,16 +836,50 @@ vector_sub(PG_FUNCTION_ARGS)
 }
 
 /*
+ * Multiply vectors
+ */
+PGDLLEXPORT PG_FUNCTION_INFO_V1(vector_mul);
+Datum
+vector_mul(PG_FUNCTION_ARGS)
+{
+	Vector	   *a = PG_GETARG_VECTOR_P(0);
+	Vector	   *b = PG_GETARG_VECTOR_P(1);
+	float	   *ax = a->x;
+	float	   *bx = b->x;
+	Vector	   *result;
+	float	   *rx;
+
+	CheckDims(a, b);
+
+	result = InitVector(a->dim);
+	rx = result->x;
+
+	/* Auto-vectorized */
+	for (int i = 0, imax = a->dim; i < imax; i++)
+		rx[i] = ax[i] * bx[i];
+
+	/* Check for overflow and underflow */
+	for (int i = 0, imax = a->dim; i < imax; i++)
+	{
+		if (isinf(rx[i]))
+			float_overflow_error();
+
+		if (rx[i] == 0 && !(ax[i] == 0 || bx[i] == 0))
+			float_underflow_error();
+	}
+
+	PG_RETURN_POINTER(result);
+}
+
+/*
  * Internal helper to compare vectors
  */
 int
 vector_cmp_internal(Vector * a, Vector * b)
 {
-	int			i;
-
 	CheckDims(a, b);
 
-	for (i = 0; i < a->dim; i++)
+	for (int i = 0; i < a->dim; i++)
 	{
 		if (a->x[i] < b->x[i])
 			return -1;

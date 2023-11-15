@@ -1,3 +1,19 @@
+## 0.5.1 (2023-10-10)
+
+- Improved performance of HNSW index builds
+- Added check for MVCC-compliant snapshot for index scans
+
+## 0.5.0 (2023-08-28)
+
+- Added HNSW index type
+- Added support for parallel index builds for IVFFlat
+- Added `l1_distance` function
+- Added element-wise multiplication for vectors
+- Added `sum` aggregate
+- Improved performance of distance functions
+- Fixed out of range results for cosine distance
+- Fixed results for NULL and NaN distances for IVFFlat
+
 ## 0.4.4 (2023-06-12)
 
 - Improved error message for malformed vector literal

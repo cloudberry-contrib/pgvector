@@ -2,7 +2,7 @@
 
 Open-source vector similarity search for Postgres
 
-Store all of your application data in one place. Supports:
+Store your vectors with the rest of your data. Supports:
 
 - exact and approximate nearest neighbor search
 - L2 distance, inner product, and cosine distance
@@ -18,7 +18,7 @@ Compile and install the extension (supports Postgres 11+)
 
 ```sh
 cd /tmp
-git clone --branch v0.4.4 https://github.com/pgvector/pgvector.git
+git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git
 cd pgvector
 make
 make install # may need sudo
@@ -157,7 +157,16 @@ SELECT category_id, AVG(embedding) FROM items GROUP BY category_id;
 
 By default, pgvector performs exact nearest neighbor search, which provides perfect recall.
 
-You can add an index to use approximate nearest neighbor search, which trades some recall for performance. Unlike typical indexes, you will see different results for queries after adding an approximate index.
+You can add an index to use approximate nearest neighbor search, which trades some recall for speed. Unlike typical indexes, you will see different results for queries after adding an approximate index.
+
+Supported index types are:
+
+- [IVFFlat](#ivfflat)
+- [HNSW](#hnsw) - added in 0.5.0
+
+## IVFFlat
+
+An IVFFlat index divides vectors into lists, and then searches a subset of those lists that are closest to the query vector. It has faster build times and uses less memory than HNSW, but has lower query performance (in terms of speed-recall tradeoff).
 
 Three keys to achieving good recall are:
 
@@ -206,7 +215,63 @@ SELECT ...
 COMMIT;
 ```
 
-### Indexing Progress
+## HNSW
+
+An HNSW index creates a multilayer graph. It has slower build times and uses more memory than IVFFlat, but has better query performance (in terms of speed-recall tradeoff). There’s no training step like IVFFlat, so the index can be created without any data in the table.
+
+Add an index for each distance function you want to use.
+
+L2 distance
+
+```sql
+CREATE INDEX ON items USING hnsw (embedding vector_l2_ops);
+```
+
+Inner product
+
+```sql
+CREATE INDEX ON items USING hnsw (embedding vector_ip_ops);
+```
+
+Cosine distance
+
+```sql
+CREATE INDEX ON items USING hnsw (embedding vector_cosine_ops);
+```
+
+Vectors with up to 2,000 dimensions can be indexed.
+
+### Index Options
+
+Specify HNSW parameters
+
+- `m` - the max number of connections per layer (16 by default)
+- `ef_construction` - the size of the dynamic candidate list for constructing the graph (64 by default)
+
+```sql
+CREATE INDEX ON items USING hnsw (embedding vector_l2_ops) WITH (m = 16, ef_construction = 64);
+```
+
+### Query Options
+
+Specify the size of the dynamic candidate list for search (40 by default)
+
+```sql
+SET hnsw.ef_search = 100;
+```
+
+A higher value provides better recall at the cost of speed.
+
+Use `SET LOCAL` inside a transaction to set it for a single query
+
+```sql
+BEGIN;
+SET LOCAL hnsw.ef_search = 100;
+SELECT ...
+COMMIT;
+```
+
+## Indexing Progress
 
 Check [indexing progress](https://www.postgresql.org/docs/current/progress-reporting.html#CREATE-INDEX-PROGRESS-REPORTING) with Postgres 12+
 
@@ -217,13 +282,13 @@ SELECT phase, tuples_done, tuples_total FROM pg_stat_progress_create_index;
 The phases are:
 
 1. `initializing`
-2. `performing k-means`
-3. `sorting tuples`
+2. `performing k-means` - IVFFlat only
+3. `assigning tuples` - IVFFlat only
 4. `loading tuples`
 
 Note: `tuples_done` and `tuples_total` are only populated during the `loading tuples` phase
 
-### Filtering
+## Filtering
 
 There are a few ways to index nearest neighbor queries with a `WHERE` clause
 
@@ -283,7 +348,7 @@ SELECT * FROM items ORDER BY embedding <#> '[3,1,2]' LIMIT 5;
 
 ### Approximate Search
 
-To speed up queries with an index, increase the number of inverted lists (at the expense of recall).
+To speed up queries with an IVFFlat index, increase the number of inverted lists (at the expense of recall).
 
 ```sql
 CREATE INDEX ON items USING ivfflat (embedding vector_l2_ops) WITH (lists = 1000);
@@ -298,6 +363,7 @@ Language | Libraries / Examples
 C++ | [pgvector-cpp](https://github.com/pgvector/pgvector-cpp)
 C# | [pgvector-dotnet](https://github.com/pgvector/pgvector-dotnet)
 Crystal | [pgvector-crystal](https://github.com/pgvector/pgvector-crystal)
+Dart | [pgvector-dart](https://github.com/pgvector/pgvector-dart)
 Elixir | [pgvector-elixir](https://github.com/pgvector/pgvector-elixir)
 Go | [pgvector-go](https://github.com/pgvector/pgvector-go)
 Haskell | [pgvector-haskell](https://github.com/pgvector/pgvector-haskell)
@@ -327,9 +393,44 @@ Yes, pgvector uses the write-ahead log (WAL), which allows for replication and p
 
 You’ll need to use [dimensionality reduction](https://en.wikipedia.org/wiki/Dimensionality_reduction) at the moment.
 
-#### Why am I seeing less results after adding an index?
+## Troubleshooting
+
+#### Why isn’t a query using an index?
+
+The cost estimation in pgvector < 0.4.3 does not always work well with the planner. You can encourage the planner to use an index for a query with:
+
+```sql
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SELECT ...
+COMMIT;
+```
+
+#### Why isn’t a query using a parallel table scan?
+
+The planner doesn’t consider [out-of-line storage](https://www.postgresql.org/docs/current/storage-toast.html) in cost estimates, which can make a serial scan look cheaper. You can reduce the cost of a parallel scan for a query with:
+
+```sql
+BEGIN;
+SET LOCAL min_parallel_table_scan_size = 1;
+SET LOCAL parallel_setup_cost = 1;
+SELECT ...
+COMMIT;
+```
+
+or choose to store vectors inline:
+
+```sql
+ALTER TABLE items ALTER COLUMN embedding SET STORAGE PLAIN;
+```
+
+#### Why are there less results for a query after adding an IVFFlat index?
 
 The index was likely created with too little data for the number of lists. Drop the index until the table has more data.
+
+```sql
+DROP INDEX index_name;
+```
 
 ## Reference
 
@@ -339,29 +440,32 @@ Each vector takes `4 * dimensions + 8` bytes of storage. Each element is a singl
 
 ### Vector Operators
 
-Operator | Description
---- | ---
-\+ | element-wise addition
-\- | element-wise subtraction
-<-> | Euclidean distance
-<#> | negative inner product
-<=> | cosine distance
+Operator | Description | Added
+--- | --- | ---
+\+ | element-wise addition |
+\- | element-wise subtraction |
+\* | element-wise multiplication | 0.5.0
+<-> | Euclidean distance |
+<#> | negative inner product |
+<=> | cosine distance |
 
 ### Vector Functions
 
-Function | Description
---- | ---
-cosine_distance(vector, vector) → double precision | cosine distance
-inner_product(vector, vector) → double precision | inner product
-l2_distance(vector, vector) → double precision | Euclidean distance
-vector_dims(vector) → integer | number of dimensions
-vector_norm(vector) → double precision | Euclidean norm
+Function | Description | Added
+--- | --- | ---
+cosine_distance(vector, vector) → double precision | cosine distance |
+inner_product(vector, vector) → double precision | inner product |
+l2_distance(vector, vector) → double precision | Euclidean distance |
+l1_distance(vector, vector) → double precision | taxicab distance | 0.5.0
+vector_dims(vector) → integer | number of dimensions |
+vector_norm(vector) → double precision | Euclidean norm |
 
 ### Aggregate Functions
 
-Function | Description
---- | ---
-avg(vector) → vector | arithmetic mean
+Function | Description | Added
+--- | --- | ---
+avg(vector) → vector | average |
+sum(vector) → vector | sum | 0.5.0
 
 ## Installation Notes
 
@@ -393,11 +497,19 @@ Note: Replace `15` with your Postgres server version
 
 ### Windows
 
-Support for Windows is currently experimental. Use `nmake` to build:
+Support for Windows is currently experimental. Ensure [C++ support in Visual Studio](https://learn.microsoft.com/en-us/cpp/build/building-on-the-command-line?view=msvc-170#download-and-install-the-tools) is installed, and run:
+
+```cmd
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+```
+
+Note: The exact path will vary depending on your Visual Studio version and edition
+
+Then use `nmake` to build:
 
 ```cmd
 set "PGROOT=C:\Program Files\PostgreSQL\15"
-git clone --branch v0.4.4 https://github.com/pgvector/pgvector.git
+git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git
 cd pgvector
 nmake /F Makefile.win
 nmake /F Makefile.win install
@@ -418,7 +530,7 @@ This adds pgvector to the [Postgres image](https://hub.docker.com/_/postgres) (r
 You can also build the image manually:
 
 ```sh
-git clone --branch v0.4.4 https://github.com/pgvector/pgvector.git
+git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git
 cd pgvector
 docker build --build-arg PG_MAJOR=15 -t myuser/pgvector .
 ```
@@ -481,17 +593,18 @@ Download the [latest release](https://postgresapp.com/downloads.html) with Postg
 
 pgvector is available on [these providers](https://github.com/pgvector/pgvector/issues/54).
 
-To request a new extension on other providers:
-
-- DigitalOcean Managed Databases - vote or comment on [this page](https://ideas.digitalocean.com/managed-database/p/pgvector-extension-for-postgresql)
-- Heroku Postgres - vote or comment on [this page](https://github.com/heroku/roadmap/issues/156)
-
 ## Upgrading
 
-Install the latest version and run:
+Install the latest version. Then in each database you want to upgrade, run:
 
 ```sql
 ALTER EXTENSION vector UPDATE;
+```
+
+You can check the version in the current database with:
+
+```sql
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
 ```
 
 ## Upgrade Notes
@@ -526,9 +639,10 @@ Thanks to:
 
 - [PASE: PostgreSQL Ultra-High-Dimensional Approximate Nearest Neighbor Search Extension](https://dl.acm.org/doi/pdf/10.1145/3318464.3386131)
 - [Faiss: A Library for Efficient Similarity Search and Clustering of Dense Vectors](https://github.com/facebookresearch/faiss)
-- [Using the Triangle Inequality to Accelerate k-means](https://www.aaai.org/Papers/ICML/2003/ICML03-022.pdf)
+- [Using the Triangle Inequality to Accelerate k-means](https://cdn.aaai.org/ICML/2003/ICML03-022.pdf)
 - [k-means++: The Advantage of Careful Seeding](https://theory.stanford.edu/~sergei/papers/kMeansPP-soda.pdf)
 - [Concept Decompositions for Large Sparse Text Data using Clustering](https://www.cs.utexas.edu/users/inderjit/public_papers/concept_mlj.pdf)
+- [Efficient and Robust Approximate Nearest Neighbor Search using Hierarchical Navigable Small World Graphs](https://arxiv.org/ftp/arxiv/papers/1603/1603.09320.pdf)
 
 ## History
 
@@ -576,4 +690,4 @@ Resources for contributors
 
 - [Extension Building Infrastructure](https://www.postgresql.org/docs/current/extend-pgxs.html)
 - [Index Access Method Interface Definition](https://www.postgresql.org/docs/current/indexam.html)
-- [Generic WAL Records](https://www.postgresql.org/docs/13/generic-wal.html)
+- [Generic WAL Records](https://www.postgresql.org/docs/current/generic-wal.html)
