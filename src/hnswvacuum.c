@@ -2,6 +2,7 @@
 
 #include <math.h>
 
+#include "access/generic_xlog.h"
 #include "commands/vacuum.h"
 #include "hnsw.h"
 #include "storage/bufmgr.h"
@@ -12,12 +13,9 @@
  * Check if deleted list contains an index TID
  */
 static bool
-DeletedContains(HTAB *deleted, ItemPointer indextid)
+DeletedContains(tidhash_hash * deleted, ItemPointer indextid)
 {
-	bool		found;
-
-	hash_search(deleted, indextid, HASH_FIND, &found);
-	return found;
+	return tidhash_lookup(deleted, *indextid) != NULL;
 }
 
 /*
@@ -93,14 +91,9 @@ RemoveHeapTids(HnswVacuumState * vacuumstate)
 
 				if (itemUpdated)
 				{
-					Size		etupSize = HNSW_ELEMENT_TUPLE_SIZE(etup->vec.dim);
-
 					/* Mark rest as invalid */
 					for (int i = idx; i < HNSW_HEAPTIDS; i++)
 						ItemPointerSetInvalid(&etup->heaptids[i]);
-
-					if (!PageIndexTupleOverwrite(page, offno, (Item) etup, etupSize))
-						elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
 
 					updated = true;
 				}
@@ -109,11 +102,13 @@ RemoveHeapTids(HnswVacuumState * vacuumstate)
 			if (!ItemPointerIsValid(&etup->heaptids[0]))
 			{
 				ItemPointerData ip;
+				bool		found;
 
 				/* Add to deleted list */
 				ItemPointerSet(&ip, blkno, offno);
 
-				(void) hash_search(vacuumstate->deleted, &ip, HASH_ENTER, NULL);
+				tidhash_insert(vacuumstate->deleted, ip, &found);
+				Assert(!found);
 			}
 			else if (etup->level > highestLevel && !(entryPoint != NULL && blkno == entryPoint->blkno && offno == entryPoint->offno))
 			{
@@ -189,31 +184,34 @@ static void
 RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswElement entryPoint)
 {
 	Relation	index = vacuumstate->index;
+	HnswSupport *support = &vacuumstate->support;
 	Buffer		buf;
 	Page		page;
 	GenericXLogState *state;
 	int			m = vacuumstate->m;
 	int			efConstruction = vacuumstate->efConstruction;
-	FmgrInfo   *procinfo = vacuumstate->procinfo;
-	Oid			collation = vacuumstate->collation;
 	BufferAccessStrategy bas = vacuumstate->bas;
 	HnswNeighborTuple ntup = vacuumstate->ntup;
 	Size		ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(element->level, m);
+	char	   *base = NULL;
 
 	/* Skip if element is entry point */
 	if (entryPoint != NULL && element->blkno == entryPoint->blkno && element->offno == entryPoint->offno)
 		return;
 
 	/* Init fields */
-	HnswInitNeighbors(element, m);
-	element->heaptids = NIL;
+	HnswInitNeighbors(base, element, m, NULL);
+	element->heaptidsLength = 0;
 
-	/* Add element to graph, skipping itself */
-	HnswInsertElement(element, entryPoint, index, procinfo, collation, m, efConstruction, true);
+	/* Find neighbors for element, skipping itself */
+	HnswFindElementNeighbors(base, element, entryPoint, index, support, m, efConstruction, true);
+
+	/* Zero memory for each element */
+	MemSet(ntup, 0, HNSW_TUPLE_ALLOC_SIZE);
 
 	/* Update neighbor tuple */
 	/* Do this before getting page to minimize locking */
-	HnswSetNeighborTuple(ntup, element, m);
+	HnswSetNeighborTuple(base, ntup, element, m);
 
 	/* Get neighbor page */
 	buf = ReadBufferExtended(index, MAIN_FORKNUM, element->neighborPage, RBM_NORMAL, bas);
@@ -230,7 +228,7 @@ RepairGraphElement(HnswVacuumState * vacuumstate, HnswElement element, HnswEleme
 	UnlockReleaseBuffer(buf);
 
 	/* Update neighbors */
-	HnswUpdateNeighborPages(index, procinfo, collation, element, m, true);
+	HnswUpdateNeighborsOnDisk(index, support, element, m, true, false);
 }
 
 /*
@@ -240,6 +238,7 @@ static void
 RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 {
 	Relation	index = vacuumstate->index;
+	HnswSupport *support = &vacuumstate->support;
 	HnswElement highestPoint = &vacuumstate->highestPoint;
 	HnswElement entryPoint;
 	MemoryContext oldCtx = MemoryContextSwitchTo(vacuumstate->tmpCtx);
@@ -257,7 +256,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 		LockPage(index, HNSW_UPDATE_LOCK, ShareLock);
 
 		/* Load element */
-		HnswLoadElement(highestPoint, NULL, NULL, index, vacuumstate->procinfo, vacuumstate->collation, true);
+		HnswLoadElement(highestPoint, NULL, NULL, index, support, true, NULL);
 
 		/* Repair if needed */
 		if (NeedsUpdated(vacuumstate, highestPoint))
@@ -286,7 +285,7 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 			 * point is outdated and empty, the entry point will be empty
 			 * until an element is repaired.
 			 */
-			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM);
+			HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_ALWAYS, highestPoint, InvalidBlockNumber, MAIN_FORKNUM, false);
 		}
 		else
 		{
@@ -295,13 +294,13 @@ RepairGraphEntryPoint(HnswVacuumState * vacuumstate)
 			 * is outdated, this can remove connections at higher levels in
 			 * the graph until they are repaired, but this should be fine.
 			 */
-			HnswLoadElement(entryPoint, NULL, NULL, index, vacuumstate->procinfo, vacuumstate->collation, true);
+			HnswLoadElement(entryPoint, NULL, NULL, index, support, true, NULL);
 
 			if (NeedsUpdated(vacuumstate, entryPoint))
 			{
 				/* Reset neighbors from previous update */
 				if (highestPoint != NULL)
-					highestPoint->neighbors = NULL;
+					HnswPtrStore((char *) NULL, highestPoint->neighbors, (HnswNeighborArrayPtr *) NULL);
 
 				RepairGraphElement(vacuumstate, entryPoint, highestPoint);
 			}
@@ -419,7 +418,7 @@ RepairGraph(HnswVacuumState * vacuumstate)
 			 * was replaced and highest point was outdated.
 			 */
 			if (entryPoint == NULL || element->level > entryPoint->level)
-				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM);
+				HnswUpdateMetaPage(index, HNSW_UPDATE_ENTRY_GREATER, element, InvalidBlockNumber, MAIN_FORKNUM, false);
 
 			/* Release lock */
 			UnlockPage(index, HNSW_UPDATE_LOCK, lockmode);
@@ -479,8 +478,6 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 		{
 			HnswElementTuple etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 			HnswNeighborTuple ntup;
-			Size		etupSize;
-			Size		ntupSize;
 			Buffer		nbuf;
 			Page		npage;
 			BlockNumber neighborPage;
@@ -504,10 +501,6 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 			if (ItemPointerIsValid(&etup->heaptids[0]))
 				continue;
 
-			/* Calculate sizes */
-			etupSize = HNSW_ELEMENT_TUPLE_SIZE(etup->vec.dim);
-			ntupSize = HNSW_NEIGHBOR_TUPLE_SIZE(etup->level, vacuumstate->m);
-
 			/* Get neighbor page */
 			neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
 			neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
@@ -528,19 +521,24 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 
 			/* Overwrite element */
 			etup->deleted = 1;
-			MemSet(&etup->vec.x, 0, etup->vec.dim * sizeof(float));
+			MemSet(&etup->data, 0, VARSIZE_ANY(&etup->data));
 
 			/* Overwrite neighbors */
 			for (int i = 0; i < ntup->count; i++)
 				ItemPointerSetInvalid(&ntup->indextids[i]);
 
-			/* Overwrite element tuple */
-			if (!PageIndexTupleOverwrite(page, offno, (Item) etup, etupSize))
-				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+			/* Increment version */
+			/* This is used to avoid incorrect reads for iterative scans */
+			/* Reserve some bits for future use */
+			etup->version++;
+			if (etup->version > 15)
+				etup->version = 1;
+			ntup->version = etup->version;
 
-			/* Overwrite neighbor tuple */
-			if (!PageIndexTupleOverwrite(npage, neighborOffno, (Item) ntup, ntupSize))
-				elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(index));
+			/*
+			 * We modified the tuples in place, no need to call
+			 * PageIndexTupleOverwrite
+			 */
 
 			/* Commit */
 			GenericXLogFinish(state);
@@ -563,7 +561,7 @@ MarkDeleted(HnswVacuumState * vacuumstate)
 	}
 
 	/* Update insert page last, after everything has been marked as deleted */
-	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM);
+	HnswUpdateMetaPage(index, 0, NULL, insertPage, MAIN_FORKNUM, false);
 }
 
 /*
@@ -573,7 +571,6 @@ static void
 InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkDeleteResult *stats, IndexBulkDeleteCallback callback, void *callback_state)
 {
 	Relation	index = info->index;
-	HASHCTL		hash_ctl;
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -584,21 +581,18 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 	vacuumstate->callback_state = callback_state;
 	vacuumstate->efConstruction = HnswGetEfConstruction(index);
 	vacuumstate->bas = GetAccessStrategy(BAS_BULKREAD);
-	vacuumstate->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
-	vacuumstate->collation = index->rd_indcollation[0];
-	vacuumstate->ntup = palloc0(BLCKSZ);
+	vacuumstate->ntup = palloc0(HNSW_TUPLE_ALLOC_SIZE);
 	vacuumstate->tmpCtx = AllocSetContextCreate(CurrentMemoryContext,
 												"Hnsw vacuum temporary context",
 												ALLOCSET_DEFAULT_SIZES);
+
+	HnswInitSupport(&vacuumstate->support, index);
 
 	/* Get m from metapage */
 	HnswGetMetaPageInfo(index, &vacuumstate->m, NULL);
 
 	/* Create hash table */
-	hash_ctl.keysize = sizeof(ItemPointerData);
-	hash_ctl.entrysize = sizeof(ItemPointerData);
-	hash_ctl.hcxt = CurrentMemoryContext;
-	vacuumstate->deleted = hash_create("hnswbulkdelete indextids", 256, &hash_ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	vacuumstate->deleted = tidhash_create(CurrentMemoryContext, 256, NULL);
 }
 
 /*
@@ -607,7 +601,7 @@ InitVacuumState(HnswVacuumState * vacuumstate, IndexVacuumInfo *info, IndexBulkD
 static void
 FreeVacuumState(HnswVacuumState * vacuumstate)
 {
-	hash_destroy(vacuumstate->deleted);
+	tidhash_destroy(vacuumstate->deleted);
 	FreeAccessStrategy(vacuumstate->bas);
 	pfree(vacuumstate->ntup);
 	MemoryContextDelete(vacuumstate->tmpCtx);
