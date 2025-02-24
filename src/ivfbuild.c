@@ -10,6 +10,7 @@
 #include "catalog/index.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
+#include "cdb/cdbvars.h"
 #include "commands/progress.h"
 #include "halfvec.h"
 #include "ivfflat.h"
@@ -420,7 +421,7 @@ ComputeCenters(IvfflatBuildState * buildstate)
 	/* Sample rows */
 	/* TODO Ensure within maintenance_work_mem */
 	buildstate->samples = VectorArrayInit(numSamples, buildstate->dimensions, buildstate->centers->itemsize);
-	if (buildstate->heap != NULL)
+	if (buildstate->heap != NULL && Gp_role != GP_ROLE_DISPATCH)
 	{
 		SampleRows(buildstate);
 

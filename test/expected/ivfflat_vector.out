@@ -1,8 +1,12 @@
 SET enable_seqscan = off;
 -- L2
 CREATE TABLE t (val vector(3));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 1);
+NOTICE:  ivfflat index created with little data  (seg2 10.13.9.77:7004 pid=16887)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
    val   
@@ -26,7 +30,13 @@ SELECT COUNT(*) FROM t;
 (1 row)
 
 TRUNCATE t;
-NOTICE:  ivfflat index created with little data
+NOTICE:  ivfflat index created with little data  (seg2 10.13.9.77:7004 pid=16887)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
+NOTICE:  ivfflat index created with little data  (seg0 10.13.9.77:7002 pid=16885)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
+NOTICE:  ivfflat index created with little data  (seg1 10.13.9.77:7003 pid=16886)
 DETAIL:  This will cause low recall.
 HINT:  Drop the index until the table has more data.
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
@@ -37,8 +47,12 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 DROP TABLE t;
 -- inner product
 CREATE TABLE t (val vector(3));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING ivfflat (val vector_ip_ops) WITH (lists = 1);
+NOTICE:  ivfflat index created with little data  (seg1 10.13.9.77:7003 pid=16886)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <#> '[3,3,3]';
    val   
@@ -58,8 +72,12 @@ SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <#> (SELECT NULL::vector)) t2
 DROP TABLE t;
 -- cosine
 CREATE TABLE t (val vector(3));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING ivfflat (val vector_cosine_ops) WITH (lists = 1);
+NOTICE:  ivfflat index created with little data  (seg2 10.13.9.77:7004 pid=16887)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <=> '[3,3,3]';
    val   
@@ -84,8 +102,18 @@ SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <=> (SELECT NULL::vector)) t2
 DROP TABLE t;
 -- iterative
 CREATE TABLE t (val vector(3));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 3);
+NOTICE:  ivfflat index created with little data  (seg0 10.13.9.77:7002 pid=16885)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
+NOTICE:  ivfflat index created with little data  (seg2 10.13.9.77:7004 pid=16887)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
+NOTICE:  ivfflat index created with little data  (seg1 10.13.9.77:7003 pid=16886)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
 SET ivfflat.iterative_scan = relaxed_order;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
    val   
@@ -115,8 +143,12 @@ RESET ivfflat.max_probes;
 DROP TABLE t;
 -- unlogged
 CREATE UNLOGGED TABLE t (val vector(3));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 1);
+NOTICE:  ivfflat index created with little data  (seg0 10.13.9.77:7002 pid=16885)
+DETAIL:  This will cause low recall.
+HINT:  Drop the index until the table has more data.
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
    val   
 ---------
@@ -128,6 +160,7 @@ SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 DROP TABLE t;
 -- options
 CREATE TABLE t (val vector(3));
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 0);
 ERROR:  value 0 out of bounds for option "lists"
 DETAIL:  Valid values are between "1" and "32768".
