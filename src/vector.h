@@ -12,12 +12,19 @@ typedef struct Vector
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	int16		dim;			/* number of dimensions */
-	int16		unused;
+	int16		unused;			/* reserved for future use, always zero */
 	float		x[FLEXIBLE_ARRAY_MEMBER];
 }			Vector;
 
 Vector	   *InitVector(int dim);
 void		PrintVector(char *msg, Vector * vector);
 int			vector_cmp_internal(Vector * a, Vector * b);
+
+/* TODO Move to better place */
+#if PG_VERSION_NUM >= 160000
+#define FUNCTION_PREFIX
+#else
+#define FUNCTION_PREFIX PGDLLEXPORT
+#endif
 
 #endif
