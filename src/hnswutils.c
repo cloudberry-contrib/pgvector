@@ -2,9 +2,103 @@
 
 #include <math.h>
 
+#include "access/generic_xlog.h"
+#include "catalog/pg_type.h"
+#include "catalog/pg_type_d.h"
+#include "common/hashfn.h"
+#include "fmgr.h"
 #include "hnsw.h"
+#include "lib/pairingheap.h"
+#include "sparsevec.h"
 #include "storage/bufmgr.h"
-#include "vector.h"
+#include "utils/datum.h"
+#include "utils/memdebug.h"
+#include "utils/rel.h"
+
+#if PG_VERSION_NUM < 170000
+static inline uint64
+murmurhash64(uint64 data)
+{
+	uint64		h = data;
+
+	h ^= h >> 33;
+	h *= 0xff51afd7ed558ccd;
+	h ^= h >> 33;
+	h *= 0xc4ceb9fe1a85ec53;
+	h ^= h >> 33;
+
+	return h;
+}
+#endif
+
+/* TID hash table */
+static uint32
+hash_tid(ItemPointerData tid)
+{
+	union
+	{
+		uint64		i;
+		ItemPointerData tid;
+	}			x;
+
+	/* Initialize unused bytes */
+	x.i = 0;
+	x.tid = tid;
+
+	return murmurhash64(x.i);
+}
+
+#define SH_PREFIX		tidhash
+#define SH_ELEMENT_TYPE	TidHashEntry
+#define SH_KEY_TYPE		ItemPointerData
+#define	SH_KEY			tid
+#define SH_HASH_KEY(tb, key)	hash_tid(key)
+#define SH_EQUAL(tb, a, b)		ItemPointerEquals(&a, &b)
+#define	SH_SCOPE		extern
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+/* Pointer hash table */
+static uint32
+hash_pointer(uintptr_t ptr)
+{
+#if SIZEOF_VOID_P == 8
+	return murmurhash64((uint64) ptr);
+#else
+	return murmurhash32((uint32) ptr);
+#endif
+}
+
+#define SH_PREFIX		pointerhash
+#define SH_ELEMENT_TYPE	PointerHashEntry
+#define SH_KEY_TYPE		uintptr_t
+#define	SH_KEY			ptr
+#define SH_HASH_KEY(tb, key)	hash_pointer(key)
+#define SH_EQUAL(tb, a, b)		(a == b)
+#define	SH_SCOPE		extern
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+/* Offset hash table */
+static uint32
+hash_offset(Size offset)
+{
+#if SIZEOF_SIZE_T == 8
+	return murmurhash64((uint64) offset);
+#else
+	return murmurhash32((uint32) offset);
+#endif
+}
+
+#define SH_PREFIX		offsethash
+#define SH_ELEMENT_TYPE	OffsetHashEntry
+#define SH_KEY_TYPE		Size
+#define	SH_KEY			offset
+#define SH_HASH_KEY(tb, key)	hash_offset(key)
+#define SH_EQUAL(tb, a, b)		(a == b)
+#define	SH_SCOPE		extern
+#define SH_DEFINE
+#include "lib/simplehash.h"
 
 /*
  * Get the max number of connections in an upper layer for each element in the index
@@ -47,34 +141,32 @@ HnswOptionalProcInfo(Relation index, uint16 procnum)
 }
 
 /*
- * Divide by the norm
- *
- * Returns false if value should not be indexed
- *
- * The caller needs to free the pointer stored in value
- * if it's different than the original value
+ * Init support functions
+ */
+void
+HnswInitSupport(HnswSupport * support, Relation index)
+{
+	support->procinfo = index_getprocinfo(index, 1, HNSW_DISTANCE_PROC);
+	support->collation = index->rd_indcollation[0];
+	support->normprocinfo = HnswOptionalProcInfo(index, HNSW_NORM_PROC);
+}
+
+/*
+ * Normalize value
+ */
+Datum
+HnswNormValue(const HnswTypeInfo * typeInfo, Oid collation, Datum value)
+{
+	return DirectFunctionCall1Coll(typeInfo->normalize, collation, value);
+}
+
+/*
+ * Check if non-zero norm
  */
 bool
-HnswNormValue(FmgrInfo *procinfo, Oid collation, Datum *value, Vector * result)
+HnswCheckNorm(HnswSupport * support, Datum value)
 {
-	double		norm = DatumGetFloat8(FunctionCall1Coll(procinfo, collation, *value));
-
-	if (norm > 0)
-	{
-		Vector	   *v = DatumGetVector(*value);
-
-		if (result == NULL)
-			result = InitVector(v->dim);
-
-		for (int i = 0; i < v->dim; i++)
-			result->x[i] = v->x[i] / norm;
-
-		*value = PointerGetDatum(result);
-
-		return true;
-	}
-
-	return false;
+	return DatumGetFloat8(FunctionCall1Coll(support->normprocinfo, support->collation, value)) > 0;
 }
 
 /*
@@ -101,66 +193,52 @@ HnswInitPage(Buffer buf, Page page)
 }
 
 /*
- * Init and register page
+ * Allocate a neighbor array
  */
-void
-HnswInitRegisterPage(Relation index, Buffer *buf, Page *page, GenericXLogState **state)
+HnswNeighborArray *
+HnswInitNeighborArray(int lm, HnswAllocator * allocator)
 {
-	*state = GenericXLogStart(index);
-	*page = GenericXLogRegisterBuffer(*state, *buf, GENERIC_XLOG_FULL_IMAGE);
-	HnswInitPage(*buf, *page);
-}
+	HnswNeighborArray *a = HnswAlloc(allocator, HNSW_NEIGHBOR_ARRAY_SIZE(lm));
 
-/*
- * Commit buffer
- */
-void
-HnswCommitBuffer(Buffer buf, GenericXLogState *state)
-{
-	GenericXLogFinish(state);
-	UnlockReleaseBuffer(buf);
+	a->length = 0;
+	a->closerSet = false;
+	return a;
 }
 
 /*
  * Allocate neighbors
  */
 void
-HnswInitNeighbors(HnswElement element, int m)
+HnswInitNeighbors(char *base, HnswElement element, int m, HnswAllocator * allocator)
 {
 	int			level = element->level;
+	HnswNeighborArrayPtr *neighborList = (HnswNeighborArrayPtr *) HnswAlloc(allocator, sizeof(HnswNeighborArrayPtr) * (level + 1));
 
-	element->neighbors = palloc(sizeof(HnswNeighborArray) * (level + 1));
+	HnswPtrStore(base, element->neighbors, neighborList);
 
 	for (int lc = 0; lc <= level; lc++)
-	{
-		HnswNeighborArray *a;
-		int			lm = HnswGetLayerM(m, lc);
-
-		a = &element->neighbors[lc];
-		a->length = 0;
-		a->items = palloc(sizeof(HnswCandidate) * lm);
-		a->closerSet = false;
-	}
+		HnswPtrStore(base, neighborList[lc], HnswInitNeighborArray(HnswGetLayerM(m, lc), allocator));
 }
 
 /*
- * Free neighbors
+ * Allocate memory from the allocator
  */
-static void
-HnswFreeNeighbors(HnswElement element)
+void *
+HnswAlloc(HnswAllocator * allocator, Size size)
 {
-	for (int lc = 0; lc <= element->level; lc++)
-		pfree(element->neighbors[lc].items);
-	pfree(element->neighbors);
+	if (allocator)
+		return (*(allocator)->alloc) (size, (allocator)->state);
+
+	return palloc(size);
 }
 
 /*
  * Allocate an element
  */
 HnswElement
-HnswInitElement(ItemPointer heaptid, int m, double ml, int maxLevel)
+HnswInitElement(char *base, ItemPointer heaptid, int m, double ml, int maxLevel, HnswAllocator * allocator)
 {
-	HnswElement element = palloc(sizeof(HnswElementData));
+	HnswElement element = HnswAlloc(allocator, sizeof(HnswElementData));
 
 	int			level = (int) (-log(RandomDouble()) * ml);
 
@@ -168,27 +246,19 @@ HnswInitElement(ItemPointer heaptid, int m, double ml, int maxLevel)
 	if (level > maxLevel)
 		level = maxLevel;
 
-	element->heaptids = NIL;
+	element->heaptidsLength = 0;
 	HnswAddHeapTid(element, heaptid);
 
 	element->level = level;
 	element->deleted = 0;
+	/* Start at one to make it easier to find issues */
+	element->version = 1;
 
-	HnswInitNeighbors(element, m);
+	HnswInitNeighbors(base, element, m, allocator);
+
+	HnswPtrStore(base, element->value, (Pointer) NULL);
 
 	return element;
-}
-
-/*
- * Free an element
- */
-void
-HnswFreeElement(HnswElement element)
-{
-	HnswFreeNeighbors(element);
-	list_free_deep(element->heaptids);
-	pfree(element->vec);
-	pfree(element);
 }
 
 /*
@@ -197,10 +267,7 @@ HnswFreeElement(HnswElement element)
 void
 HnswAddHeapTid(HnswElement element, ItemPointer heaptid)
 {
-	ItemPointer copy = palloc(sizeof(ItemPointerData));
-
-	ItemPointerCopy(heaptid, copy);
-	element->heaptids = lappend(element->heaptids, copy);
+	element->heaptids[element->heaptidsLength++] = *heaptid;
 }
 
 /*
@@ -210,11 +277,12 @@ HnswElement
 HnswInitElementFromBlock(BlockNumber blkno, OffsetNumber offno)
 {
 	HnswElement element = palloc(sizeof(HnswElementData));
+	char	   *base = NULL;
 
 	element->blkno = blkno;
 	element->offno = offno;
-	element->neighbors = NULL;
-	element->vec = NULL;
+	HnswPtrStore(base, element->neighbors, (HnswNeighborArrayPtr *) NULL);
+	HnswPtrStore(base, element->value, (Pointer) NULL);
 	return element;
 }
 
@@ -233,13 +301,19 @@ HnswGetMetaPageInfo(Relation index, int *m, HnswElement * entryPoint)
 	page = BufferGetPage(buf);
 	metap = HnswPageGetMeta(page);
 
+	if (unlikely(metap->magicNumber != HNSW_MAGIC_NUMBER))
+		elog(ERROR, "hnsw index is not valid");
+
 	if (m != NULL)
 		*m = metap->m;
 
 	if (entryPoint != NULL)
 	{
 		if (BlockNumberIsValid(metap->entryBlkno))
+		{
 			*entryPoint = HnswInitElementFromBlock(metap->entryBlkno, metap->entryOffno);
+			(*entryPoint)->level = metap->entryLevel;
+		}
 		else
 			*entryPoint = NULL;
 	}
@@ -292,7 +366,7 @@ HnswUpdateMetaPageInfo(Page page, int updateEntry, HnswElement entryPoint, Block
  * Update the metapage
  */
 void
-HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum)
+HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, BlockNumber insertPage, ForkNumber forkNum, bool building)
 {
 	Buffer		buf;
 	Page		page;
@@ -300,38 +374,80 @@ HnswUpdateMetaPage(Relation index, int updateEntry, HnswElement entryPoint, Bloc
 
 	buf = ReadBufferExtended(index, forkNum, HNSW_METAPAGE_BLKNO, RBM_NORMAL, NULL);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-	state = GenericXLogStart(index);
-	page = GenericXLogRegisterBuffer(state, buf, 0);
+	if (building)
+	{
+		state = NULL;
+		page = BufferGetPage(buf);
+	}
+	else
+	{
+		state = GenericXLogStart(index);
+		page = GenericXLogRegisterBuffer(state, buf, 0);
+	}
 
 	HnswUpdateMetaPageInfo(page, updateEntry, entryPoint, insertPage);
 
-	HnswCommitBuffer(buf, state);
+	if (building)
+		MarkBufferDirty(buf);
+	else
+		GenericXLogFinish(state);
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * Form index value
+ */
+bool
+HnswFormIndexValue(Datum *out, Datum *values, bool *isnull, const HnswTypeInfo * typeInfo, HnswSupport * support)
+{
+	/* Detoast once for all calls */
+	Datum		value = PointerGetDatum(PG_DETOAST_DATUM(values[0]));
+
+	/* Check value */
+	if (typeInfo->checkValue != NULL)
+		typeInfo->checkValue(DatumGetPointer(value));
+
+	/* Normalize if needed */
+	if (support->normprocinfo != NULL)
+	{
+		if (!HnswCheckNorm(support, value))
+			return false;
+
+		value = HnswNormValue(typeInfo, support->collation, value);
+	}
+
+	*out = value;
+
+	return true;
 }
 
 /*
  * Set element tuple, except for neighbor info
  */
 void
-HnswSetElementTuple(HnswElementTuple etup, HnswElement element)
+HnswSetElementTuple(char *base, HnswElementTuple etup, HnswElement element)
 {
+	Pointer		valuePtr = HnswPtrAccess(base, element->value);
+
 	etup->type = HNSW_ELEMENT_TUPLE_TYPE;
 	etup->level = element->level;
 	etup->deleted = 0;
+	etup->version = element->version;
 	for (int i = 0; i < HNSW_HEAPTIDS; i++)
 	{
-		if (i < list_length(element->heaptids))
-			etup->heaptids[i] = *((ItemPointer) list_nth(element->heaptids, i));
+		if (i < element->heaptidsLength)
+			etup->heaptids[i] = element->heaptids[i];
 		else
 			ItemPointerSetInvalid(&etup->heaptids[i]);
 	}
-	memcpy(&etup->vec, element->vec, VECTOR_SIZE(element->vec->dim));
+	memcpy(&etup->data, valuePtr, VARSIZE_ANY(valuePtr));
 }
 
 /*
  * Set neighbor tuple
  */
 void
-HnswSetNeighborTuple(HnswNeighborTuple ntup, HnswElement e, int m)
+HnswSetNeighborTuple(char *base, HnswNeighborTuple ntup, HnswElement e, int m)
 {
 	int			idx = 0;
 
@@ -339,7 +455,7 @@ HnswSetNeighborTuple(HnswNeighborTuple ntup, HnswElement e, int m)
 
 	for (int lc = e->level; lc >= 0; lc--)
 	{
-		HnswNeighborArray *neighbors = &e->neighbors[lc];
+		HnswNeighborArray *neighbors = HnswGetNeighbors(base, e, lc);
 		int			lm = HnswGetLayerM(m, lc);
 
 		for (int i = 0; i < lm; i++)
@@ -349,8 +465,9 @@ HnswSetNeighborTuple(HnswNeighborTuple ntup, HnswElement e, int m)
 			if (i < neighbors->length)
 			{
 				HnswCandidate *hc = &neighbors->items[i];
+				HnswElement hce = HnswPtrAccess(base, hc->element);
 
-				ItemPointerSet(indextid, hc->element->blkno, hc->element->offno);
+				ItemPointerSet(indextid, hce->blkno, hce->offno);
 			}
 			else
 				ItemPointerSetInvalid(indextid);
@@ -358,67 +475,7 @@ HnswSetNeighborTuple(HnswNeighborTuple ntup, HnswElement e, int m)
 	}
 
 	ntup->count = idx;
-}
-
-/*
- * Load neighbors from page
- */
-static void
-LoadNeighborsFromPage(HnswElement element, Relation index, Page page, int m)
-{
-	HnswNeighborTuple ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
-	int			neighborCount = (element->level + 2) * m;
-
-	Assert(HnswIsNeighborTuple(ntup));
-
-	HnswInitNeighbors(element, m);
-
-	/* Ensure expected neighbors */
-	if (ntup->count != neighborCount)
-		return;
-
-	for (int i = 0; i < neighborCount; i++)
-	{
-		HnswElement e;
-		int			level;
-		HnswCandidate *hc;
-		ItemPointer indextid;
-		HnswNeighborArray *neighbors;
-
-		indextid = &ntup->indextids[i];
-
-		if (!ItemPointerIsValid(indextid))
-			continue;
-
-		e = HnswInitElementFromBlock(ItemPointerGetBlockNumber(indextid), ItemPointerGetOffsetNumber(indextid));
-
-		/* Calculate level based on offset */
-		level = element->level - i / m;
-		if (level < 0)
-			level = 0;
-
-		neighbors = &element->neighbors[level];
-		hc = &neighbors->items[neighbors->length++];
-		hc->element = e;
-	}
-}
-
-/*
- * Load neighbors
- */
-void
-HnswLoadNeighbors(HnswElement element, Relation index, int m)
-{
-	Buffer		buf;
-	Page		page;
-
-	buf = ReadBuffer(index, element->neighborPage);
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-
-	LoadNeighborsFromPage(element, index, page, m);
-
-	UnlockReleaseBuffer(buf);
+	ntup->version = e->version;
 }
 
 /*
@@ -429,9 +486,10 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 {
 	element->level = etup->level;
 	element->deleted = etup->deleted;
+	element->version = etup->version;
 	element->neighborPage = ItemPointerGetBlockNumber(&etup->neighbortid);
 	element->neighborOffno = ItemPointerGetOffsetNumber(&etup->neighbortid);
-	element->heaptids = NIL;
+	element->heaptidsLength = 0;
 
 	if (loadHeaptids)
 	{
@@ -447,63 +505,110 @@ HnswLoadElementFromTuple(HnswElement element, HnswElementTuple etup, bool loadHe
 
 	if (loadVec)
 	{
-		element->vec = palloc(VECTOR_SIZE(etup->vec.dim));
-		memcpy(element->vec, &etup->vec, VECTOR_SIZE(etup->vec.dim));
+		char	   *base = NULL;
+		Datum		value = datumCopy(PointerGetDatum(&etup->data), false, -1);
+
+		HnswPtrStore(base, element->value, DatumGetPointer(value));
 	}
+}
+
+/*
+ * Calculate the distance between values
+ */
+static inline double
+HnswGetDistance(Datum a, Datum b, HnswSupport * support)
+{
+	return DatumGetFloat8(FunctionCall2Coll(support->procinfo, support->collation, a, b));
 }
 
 /*
  * Load an element and optionally get its distance from q
  */
-void
-HnswLoadElement(HnswElement element, float *distance, Datum *q, Relation index, FmgrInfo *procinfo, Oid collation, bool loadVec)
+static void
+HnswLoadElementImpl(BlockNumber blkno, OffsetNumber offno, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance, HnswElement * element)
 {
 	Buffer		buf;
 	Page		page;
 	HnswElementTuple etup;
 
 	/* Read vector */
-	buf = ReadBuffer(index, element->blkno);
+	buf = ReadBuffer(index, blkno);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 
-	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, element->offno));
+	etup = (HnswElementTuple) PageGetItem(page, PageGetItemId(page, offno));
 
 	Assert(HnswIsElementTuple(etup));
 
-	/* Load element */
-	HnswLoadElementFromTuple(element, etup, true, loadVec);
-
 	/* Calculate distance */
 	if (distance != NULL)
-		*distance = (float) DatumGetFloat8(FunctionCall2Coll(procinfo, collation, *q, PointerGetDatum(&etup->vec)));
+	{
+		if (DatumGetPointer(q->value) == NULL)
+			*distance = 0;
+		else
+			*distance = HnswGetDistance(q->value, PointerGetDatum(&etup->data), support);
+	}
+
+	/* Load element */
+	if (distance == NULL || maxDistance == NULL || *distance < *maxDistance)
+	{
+		if (*element == NULL)
+			*element = HnswInitElementFromBlock(blkno, offno);
+
+		HnswLoadElementFromTuple(*element, etup, true, loadVec);
+	}
 
 	UnlockReleaseBuffer(buf);
 }
 
 /*
- * Get the distance for a candidate
+ * Load an element and optionally get its distance from q
  */
-static float
-GetCandidateDistance(HnswCandidate * hc, Datum q, FmgrInfo *procinfo, Oid collation)
+void
+HnswLoadElement(HnswElement element, double *distance, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec, double *maxDistance)
 {
-	return DatumGetFloat8(FunctionCall2Coll(procinfo, collation, q, PointerGetDatum(hc->element->vec)));
+	HnswLoadElementImpl(element->blkno, element->offno, distance, q, index, support, loadVec, maxDistance, &element);
+}
+
+/*
+ * Get the distance for an element
+ */
+static double
+GetElementDistance(char *base, HnswElement element, HnswQuery * q, HnswSupport * support)
+{
+	Datum		value = HnswGetValue(base, element);
+
+	return HnswGetDistance(q->value, value, support);
+}
+
+/*
+ * Allocate a search candidate
+ */
+static HnswSearchCandidate *
+HnswInitSearchCandidate(char *base, HnswElement element, double distance)
+{
+	HnswSearchCandidate *sc = palloc(sizeof(HnswSearchCandidate));
+
+	HnswPtrStore(base, sc->element, element);
+	sc->distance = distance;
+	return sc;
 }
 
 /*
  * Create a candidate for the entry point
  */
-HnswCandidate *
-HnswEntryCandidate(HnswElement entryPoint, Datum q, Relation index, FmgrInfo *procinfo, Oid collation, bool loadVec)
+HnswSearchCandidate *
+HnswEntryCandidate(char *base, HnswElement entryPoint, HnswQuery * q, Relation index, HnswSupport * support, bool loadVec)
 {
-	HnswCandidate *hc = palloc(sizeof(HnswCandidate));
+	bool		inMemory = index == NULL;
+	double		distance;
 
-	hc->element = entryPoint;
-	if (index == NULL)
-		hc->distance = GetCandidateDistance(hc, q, procinfo, collation);
+	if (inMemory)
+		distance = GetElementDistance(base, entryPoint, q, support);
 	else
-		HnswLoadElement(hc->element, &hc->distance, &q, index, procinfo, collation, loadVec);
-	return hc;
+		HnswLoadElement(entryPoint, &distance, q, index, support, loadVec, NULL);
+
+	return HnswInitSearchCandidate(base, entryPoint, distance);
 }
 
 /*
@@ -512,10 +617,25 @@ HnswEntryCandidate(HnswElement entryPoint, Datum q, Relation index, FmgrInfo *pr
 static int
 CompareNearestCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	if (((const HnswPairingHeapNode *) a)->inner->distance < ((const HnswPairingHeapNode *) b)->inner->distance)
+	if (HnswGetSearchCandidateConst(c_node, a)->distance < HnswGetSearchCandidateConst(c_node, b)->distance)
 		return 1;
 
-	if (((const HnswPairingHeapNode *) a)->inner->distance > ((const HnswPairingHeapNode *) b)->inner->distance)
+	if (HnswGetSearchCandidateConst(c_node, a)->distance > HnswGetSearchCandidateConst(c_node, b)->distance)
+		return -1;
+
+	return 0;
+}
+
+/*
+ * Compare discarded candidate distances
+ */
+static int
+CompareNearestDiscardedCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	if (HnswGetSearchCandidateConst(w_node, a)->distance < HnswGetSearchCandidateConst(w_node, b)->distance)
+		return 1;
+
+	if (HnswGetSearchCandidateConst(w_node, a)->distance > HnswGetSearchCandidateConst(w_node, b)->distance)
 		return -1;
 
 	return 0;
@@ -527,41 +647,163 @@ CompareNearestCandidates(const pairingheap_node *a, const pairingheap_node *b, v
 static int
 CompareFurthestCandidates(const pairingheap_node *a, const pairingheap_node *b, void *arg)
 {
-	if (((const HnswPairingHeapNode *) a)->inner->distance < ((const HnswPairingHeapNode *) b)->inner->distance)
+	if (HnswGetSearchCandidateConst(w_node, a)->distance < HnswGetSearchCandidateConst(w_node, b)->distance)
 		return -1;
 
-	if (((const HnswPairingHeapNode *) a)->inner->distance > ((const HnswPairingHeapNode *) b)->inner->distance)
+	if (HnswGetSearchCandidateConst(w_node, a)->distance > HnswGetSearchCandidateConst(w_node, b)->distance)
 		return 1;
 
 	return 0;
 }
 
 /*
- * Create a pairing heap node for a candidate
+ * Init visited
  */
-static HnswPairingHeapNode *
-CreatePairingHeapNode(HnswCandidate * c)
+static inline void
+InitVisited(char *base, visited_hash * v, bool inMemory, int ef, int m)
 {
-	HnswPairingHeapNode *node = palloc(sizeof(HnswPairingHeapNode));
-
-	node->inner = c;
-	return node;
+	if (!inMemory)
+		v->tids = tidhash_create(CurrentMemoryContext, ef * m * 2, NULL);
+	else if (base != NULL)
+		v->offsets = offsethash_create(CurrentMemoryContext, ef * m * 2, NULL);
+	else
+		v->pointers = pointerhash_create(CurrentMemoryContext, ef * m * 2, NULL);
 }
 
 /*
  * Add to visited
  */
 static inline void
-AddToVisited(HTAB *v, HnswCandidate * hc, Relation index, bool *found)
+AddToVisited(char *base, visited_hash * v, HnswElementPtr elementPtr, bool inMemory, bool *found)
 {
-	if (index == NULL)
-		hash_search(v, &hc->element, HASH_ENTER, found);
-	else
+	if (!inMemory)
 	{
+		HnswElement element = HnswPtrAccess(base, elementPtr);
 		ItemPointerData indextid;
 
-		ItemPointerSet(&indextid, hc->element->blkno, hc->element->offno);
-		hash_search(v, &indextid, HASH_ENTER, found);
+		ItemPointerSet(&indextid, element->blkno, element->offno);
+		tidhash_insert(v->tids, indextid, found);
+	}
+	else if (base != NULL)
+	{
+		HnswElement element = HnswPtrAccess(base, elementPtr);
+
+		offsethash_insert_hash(v->offsets, HnswPtrOffset(elementPtr), element->hash, found);
+	}
+	else
+	{
+		HnswElement element = HnswPtrAccess(base, elementPtr);
+
+		pointerhash_insert_hash(v->pointers, (uintptr_t) HnswPtrPointer(elementPtr), element->hash, found);
+	}
+}
+
+/*
+ * Count element towards ef
+ */
+static inline bool
+CountElement(HnswElement skipElement, HnswElement e)
+{
+	if (skipElement == NULL)
+		return true;
+
+	/* Ensure does not access heaptidsLength during in-memory build */
+	pg_memory_barrier();
+
+	/* Keep scan-build happy on Mac x86-64 */
+	Assert(e);
+
+	return e->heaptidsLength != 0;
+}
+
+/*
+ * Load unvisited neighbors from memory
+ */
+static void
+HnswLoadUnvisitedFromMemory(char *base, HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, int lc, HnswNeighborArray * localNeighborhood, Size neighborhoodSize)
+{
+	/* Get the neighborhood at layer lc */
+	HnswNeighborArray *neighborhood = HnswGetNeighbors(base, element, lc);
+
+	/* Copy neighborhood to local memory */
+	LWLockAcquire(&element->lock, LW_SHARED);
+	memcpy(localNeighborhood, neighborhood, neighborhoodSize);
+	LWLockRelease(&element->lock);
+
+	*unvisitedLength = 0;
+
+	for (int i = 0; i < localNeighborhood->length; i++)
+	{
+		HnswCandidate *hc = &localNeighborhood->items[i];
+		bool		found;
+
+		AddToVisited(base, v, hc->element, true, &found);
+
+		if (!found)
+			unvisited[(*unvisitedLength)++].element = HnswPtrAccess(base, hc->element);
+	}
+}
+
+/*
+ * Load neighbor index TIDs
+ */
+bool
+HnswLoadNeighborTids(HnswElement element, ItemPointerData *indextids, Relation index, int m, int lm, int lc)
+{
+	Buffer		buf;
+	Page		page;
+	HnswNeighborTuple ntup;
+	int			start;
+
+	buf = ReadBuffer(index, element->neighborPage);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+
+	ntup = (HnswNeighborTuple) PageGetItem(page, PageGetItemId(page, element->neighborOffno));
+
+	/*
+	 * Ensure the neighbor tuple has not been deleted or replaced between
+	 * index scan iterations
+	 */
+	if (ntup->version != element->version || ntup->count != (element->level + 2) * m)
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	/* Copy to minimize lock time */
+	start = (element->level - lc) * m;
+	memcpy(indextids, ntup->indextids + start, lm * sizeof(ItemPointerData));
+
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
+/*
+ * Load unvisited neighbors from disk
+ */
+static void
+HnswLoadUnvisitedFromDisk(HnswElement element, HnswUnvisited * unvisited, int *unvisitedLength, visited_hash * v, Relation index, int m, int lm, int lc)
+{
+	ItemPointerData indextids[HNSW_MAX_M * 2];
+
+	*unvisitedLength = 0;
+
+	if (!HnswLoadNeighborTids(element, indextids, index, m, lm, lc))
+		return;
+
+	for (int i = 0; i < lm; i++)
+	{
+		ItemPointer indextid = &indextids[i];
+		bool		found;
+
+		if (!ItemPointerIsValid(indextid))
+			break;
+
+		tidhash_insert(v->tids, *indextid, &found);
+
+		if (!found)
+			unvisited[(*unvisitedLength)++].indextid = *indextid;
 	}
 }
 
@@ -569,114 +811,154 @@ AddToVisited(HTAB *v, HnswCandidate * hc, Relation index, bool *found)
  * Algorithm 2 from paper
  */
 List *
-HnswSearchLayer(Datum q, List *ep, int ef, int lc, Relation index, FmgrInfo *procinfo, Oid collation, int m, bool inserting, HnswElement skipElement)
+HnswSearchLayer(char *base, HnswQuery * q, List *ep, int ef, int lc, Relation index, HnswSupport * support, int m, bool inserting, HnswElement skipElement, visited_hash * v, pairingheap **discarded, bool initVisited, int64 *tuples)
 {
-	ListCell   *lc2;
-
 	List	   *w = NIL;
 	pairingheap *C = pairingheap_allocate(CompareNearestCandidates, NULL);
 	pairingheap *W = pairingheap_allocate(CompareFurthestCandidates, NULL);
 	int			wlen = 0;
-	HASHCTL		hash_ctl;
-	HTAB	   *v;
+	visited_hash vh;
+	ListCell   *lc2;
+	HnswNeighborArray *localNeighborhood = NULL;
+	Size		neighborhoodSize = 0;
+	int			lm = HnswGetLayerM(m, lc);
+	HnswUnvisited *unvisited = palloc(lm * sizeof(HnswUnvisited));
+	int			unvisitedLength;
+	bool		inMemory = index == NULL;
 
-	/* Create hash table */
-	if (index == NULL)
+	if (v == NULL)
 	{
-		hash_ctl.keysize = sizeof(HnswElement *);
-		hash_ctl.entrysize = sizeof(HnswElement *);
-	}
-	else
-	{
-		hash_ctl.keysize = sizeof(ItemPointerData);
-		hash_ctl.entrysize = sizeof(ItemPointerData);
+		v = &vh;
+		initVisited = true;
 	}
 
-	hash_ctl.hcxt = CurrentMemoryContext;
-	v = hash_create("hnsw visited", 256, &hash_ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	if (initVisited)
+	{
+		InitVisited(base, v, inMemory, ef, m);
+
+		if (discarded != NULL)
+			*discarded = pairingheap_allocate(CompareNearestDiscardedCandidates, NULL);
+	}
+
+	/* Create local memory for neighborhood if needed */
+	if (inMemory)
+	{
+		neighborhoodSize = HNSW_NEIGHBOR_ARRAY_SIZE(lm);
+		localNeighborhood = palloc(neighborhoodSize);
+	}
 
 	/* Add entry points to v, C, and W */
 	foreach(lc2, ep)
 	{
-		HnswCandidate *hc = (HnswCandidate *) lfirst(lc2);
+		HnswSearchCandidate *sc = (HnswSearchCandidate *) lfirst(lc2);
+		bool		found;
 
-		AddToVisited(v, hc, index, NULL);
+		if (initVisited)
+		{
+			AddToVisited(base, v, sc->element, inMemory, &found);
 
-		pairingheap_add(C, &(CreatePairingHeapNode(hc)->ph_node));
-		pairingheap_add(W, &(CreatePairingHeapNode(hc)->ph_node));
+			/* OK to count elements instead of tuples */
+			if (tuples != NULL)
+				(*tuples)++;
+		}
+
+		pairingheap_add(C, &sc->c_node);
+		pairingheap_add(W, &sc->w_node);
 
 		/*
 		 * Do not count elements being deleted towards ef when vacuuming. It
 		 * would be ideal to do this for inserts as well, but this could
 		 * affect insert performance.
 		 */
-		if (skipElement == NULL || list_length(hc->element->heaptids) != 0)
+		if (CountElement(skipElement, HnswPtrAccess(base, sc->element)))
 			wlen++;
 	}
 
 	while (!pairingheap_is_empty(C))
 	{
-		HnswNeighborArray *neighborhood;
-		HnswCandidate *c = ((HnswPairingHeapNode *) pairingheap_remove_first(C))->inner;
-		HnswCandidate *f = ((HnswPairingHeapNode *) pairingheap_first(W))->inner;
+		HnswSearchCandidate *c = HnswGetSearchCandidate(c_node, pairingheap_remove_first(C));
+		HnswSearchCandidate *f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
+		HnswElement cElement;
 
 		if (c->distance > f->distance)
 			break;
 
-		if (c->element->neighbors == NULL)
-			HnswLoadNeighbors(c->element, index, m);
+		cElement = HnswPtrAccess(base, c->element);
 
-		/* Get the neighborhood at layer lc */
-		neighborhood = &c->element->neighbors[lc];
+		if (inMemory)
+			HnswLoadUnvisitedFromMemory(base, cElement, unvisited, &unvisitedLength, v, lc, localNeighborhood, neighborhoodSize);
+		else
+			HnswLoadUnvisitedFromDisk(cElement, unvisited, &unvisitedLength, v, index, m, lm, lc);
 
-		for (int i = 0; i < neighborhood->length; i++)
+		/* OK to count elements instead of tuples */
+		if (tuples != NULL)
+			(*tuples) += unvisitedLength;
+
+		for (int i = 0; i < unvisitedLength; i++)
 		{
-			HnswCandidate *e = &neighborhood->items[i];
-			bool		visited;
+			HnswElement eElement;
+			HnswSearchCandidate *e;
+			double		eDistance;
+			bool		alwaysAdd = wlen < ef;
 
-			AddToVisited(v, e, index, &visited);
+			f = HnswGetSearchCandidate(w_node, pairingheap_first(W));
 
-			if (!visited)
+			if (inMemory)
 			{
-				float		eDistance;
+				eElement = unvisited[i].element;
+				eDistance = GetElementDistance(base, eElement, q, support);
+			}
+			else
+			{
+				ItemPointer indextid = &unvisited[i].indextid;
+				BlockNumber blkno = ItemPointerGetBlockNumber(indextid);
+				OffsetNumber offno = ItemPointerGetOffsetNumber(indextid);
 
-				f = ((HnswPairingHeapNode *) pairingheap_first(W))->inner;
+				/* Avoid any allocations if not adding */
+				eElement = NULL;
+				HnswLoadElementImpl(blkno, offno, &eDistance, q, index, support, inserting, alwaysAdd || discarded != NULL ? NULL : &f->distance, &eElement);
 
-				if (index == NULL)
-					eDistance = GetCandidateDistance(e, q, procinfo, collation);
-				else
-					HnswLoadElement(e->element, &eDistance, &q, index, procinfo, collation, inserting);
-
-				Assert(!e->element->deleted);
-
-				/* Make robust to issues */
-				if (e->element->level < lc)
+				if (eElement == NULL)
 					continue;
+			}
 
-				if (eDistance < f->distance || wlen < ef)
+			if (eElement == NULL || !(eDistance < f->distance || alwaysAdd))
+			{
+				if (discarded != NULL)
 				{
-					/* Copy e */
-					HnswCandidate *ec = palloc(sizeof(HnswCandidate));
+					/* Create a new candidate */
+					e = HnswInitSearchCandidate(base, eElement, eDistance);
+					pairingheap_add(*discarded, &e->w_node);
+				}
 
-					ec->element = e->element;
-					ec->distance = eDistance;
+				continue;
+			}
 
-					pairingheap_add(C, &(CreatePairingHeapNode(ec)->ph_node));
-					pairingheap_add(W, &(CreatePairingHeapNode(ec)->ph_node));
+			/* Make robust to issues */
+			if (eElement->level < lc)
+				continue;
 
-					/*
-					 * Do not count elements being deleted towards ef when
-					 * vacuuming. It would be ideal to do this for inserts as
-					 * well, but this could affect insert performance.
-					 */
-					if (skipElement == NULL || list_length(e->element->heaptids) != 0)
-					{
-						wlen++;
+			/* Create a new candidate */
+			e = HnswInitSearchCandidate(base, eElement, eDistance);
+			pairingheap_add(C, &e->c_node);
+			pairingheap_add(W, &e->w_node);
 
-						/* No need to decrement wlen */
-						if (wlen > ef)
-							pairingheap_remove_first(W);
-					}
+			/*
+			 * Do not count elements being deleted towards ef when vacuuming.
+			 * It would be ideal to do this for inserts as well, but this
+			 * could affect insert performance.
+			 */
+			if (CountElement(skipElement, eElement))
+			{
+				wlen++;
+
+				/* No need to decrement wlen */
+				if (wlen > ef)
+				{
+					HnswSearchCandidate *d = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
+
+					if (discarded != NULL)
+						pairingheap_add(*discarded, &d->w_node);
 				}
 			}
 		}
@@ -685,26 +967,22 @@ HnswSearchLayer(Datum q, List *ep, int ef, int lc, Relation index, FmgrInfo *pro
 	/* Add each element of W to w */
 	while (!pairingheap_is_empty(W))
 	{
-		HnswCandidate *hc = ((HnswPairingHeapNode *) pairingheap_remove_first(W))->inner;
+		HnswSearchCandidate *sc = HnswGetSearchCandidate(w_node, pairingheap_remove_first(W));
 
-		w = lappend(w, hc);
+		w = lappend(w, sc);
 	}
 
 	return w;
 }
 
 /*
- * Compare candidate distances
+ * Compare candidate distances with pointer tie-breaker
  */
 static int
-#if PG_VERSION_NUM >= 130000
 CompareCandidateDistances(const ListCell *a, const ListCell *b)
-#else
-CompareCandidateDistances(const void *a, const void *b)
-#endif
 {
-	HnswCandidate *hca = lfirst((ListCell *) a);
-	HnswCandidate *hcb = lfirst((ListCell *) b);
+	HnswCandidate *hca = lfirst(a);
+	HnswCandidate *hcb = lfirst(b);
 
 	if (hca->distance < hcb->distance)
 		return 1;
@@ -712,59 +990,55 @@ CompareCandidateDistances(const void *a, const void *b)
 	if (hca->distance > hcb->distance)
 		return -1;
 
-	if (hca->element < hcb->element)
+	if (HnswPtrPointer(hca->element) < HnswPtrPointer(hcb->element))
 		return 1;
 
-	if (hca->element > hcb->element)
+	if (HnswPtrPointer(hca->element) > HnswPtrPointer(hcb->element))
 		return -1;
 
 	return 0;
 }
 
 /*
- * Calculate the distance between elements
+ * Compare candidate distances with offset tie-breaker
  */
-static float
-HnswGetDistance(HnswElement a, HnswElement b, int lc, FmgrInfo *procinfo, Oid collation)
+static int
+CompareCandidateDistancesOffset(const ListCell *a, const ListCell *b)
 {
-	/* Look for cached distance */
-	if (a->neighbors != NULL)
-	{
-		Assert(a->level >= lc);
+	HnswCandidate *hca = lfirst(a);
+	HnswCandidate *hcb = lfirst(b);
 
-		for (int i = 0; i < a->neighbors[lc].length; i++)
-		{
-			if (a->neighbors[lc].items[i].element == b)
-				return a->neighbors[lc].items[i].distance;
-		}
-	}
+	if (hca->distance < hcb->distance)
+		return 1;
 
-	if (b->neighbors != NULL)
-	{
-		Assert(b->level >= lc);
+	if (hca->distance > hcb->distance)
+		return -1;
 
-		for (int i = 0; i < b->neighbors[lc].length; i++)
-		{
-			if (b->neighbors[lc].items[i].element == a)
-				return b->neighbors[lc].items[i].distance;
-		}
-	}
+	if (HnswPtrOffset(hca->element) < HnswPtrOffset(hcb->element))
+		return 1;
 
-	return DatumGetFloat8(FunctionCall2Coll(procinfo, collation, PointerGetDatum(a->vec), PointerGetDatum(b->vec)));
+	if (HnswPtrOffset(hca->element) > HnswPtrOffset(hcb->element))
+		return -1;
+
+	return 0;
 }
 
 /*
  * Check if an element is closer to q than any element from R
  */
 static bool
-CheckElementCloser(HnswCandidate * e, List *r, int lc, FmgrInfo *procinfo, Oid collation)
+CheckElementCloser(char *base, HnswCandidate * e, List *r, HnswSupport * support)
 {
+	HnswElement eElement = HnswPtrAccess(base, e->element);
+	Datum		eValue = HnswGetValue(base, eElement);
 	ListCell   *lc2;
 
 	foreach(lc2, r)
 	{
 		HnswCandidate *ri = lfirst(lc2);
-		float		distance = HnswGetDistance(e->element, ri->element, lc, procinfo, collation);
+		HnswElement riElement = HnswPtrAccess(base, ri->element);
+		Datum		riValue = HnswGetValue(base, riElement);
+		float		distance = HnswGetDistance(eValue, riValue, support);
 
 		if (distance <= e->distance)
 			return false;
@@ -777,25 +1051,32 @@ CheckElementCloser(HnswCandidate * e, List *r, int lc, FmgrInfo *procinfo, Oid c
  * Algorithm 4 from paper
  */
 static List *
-SelectNeighbors(List *c, int m, int lc, FmgrInfo *procinfo, Oid collation, HnswElement e2, HnswCandidate * newCandidate, HnswCandidate * *pruned, bool sortCandidates)
+SelectNeighbors(char *base, List *c, int lm, HnswSupport * support, bool *closerSet, HnswCandidate * newCandidate, HnswCandidate * *pruned, bool sortCandidates)
 {
 	List	   *r = NIL;
 	List	   *w = list_copy(c);
-	pairingheap *wd;
-	bool		mustCalculate = !e2->neighbors[lc].closerSet;
+	HnswCandidate **wd;
+	int			wdlen = 0;
+	int			wdoff = 0;
+	bool		mustCalculate = !(*closerSet);
 	List	   *added = NIL;
 	bool		removedAny = false;
 
-	if (list_length(w) <= m)
+	if (list_length(w) <= lm)
 		return w;
 
-	wd = pairingheap_allocate(CompareNearestCandidates, NULL);
+	wd = palloc(sizeof(HnswCandidate *) * list_length(w));
 
 	/* Ensure order of candidates is deterministic for closer caching */
 	if (sortCandidates)
-		list_sort(w, CompareCandidateDistances);
+	{
+		if (base == NULL)
+			list_sort(w, CompareCandidateDistances);
+		else
+			list_sort(w, CompareCandidateDistancesOffset);
+	}
 
-	while (list_length(w) > 0 && list_length(r) < m)
+	while (list_length(w) > 0 && list_length(r) < lm)
 	{
 		/* Assumes w is already ordered desc */
 		HnswCandidate *e = llast(w);
@@ -804,16 +1085,20 @@ SelectNeighbors(List *c, int m, int lc, FmgrInfo *procinfo, Oid collation, HnswE
 
 		/* Use previous state of r and wd to skip work when possible */
 		if (mustCalculate)
-			e->closer = CheckElementCloser(e, r, lc, procinfo, collation);
+			e->closer = CheckElementCloser(base, e, r, support);
 		else if (list_length(added) > 0)
 		{
+			/* Keep Valgrind happy for in-memory, parallel builds */
+			if (base != NULL)
+				VALGRIND_MAKE_MEM_DEFINED(&e->closer, 1);
+
 			/*
 			 * If the current candidate was closer, we only need to compare it
 			 * with the other candidates that we have added.
 			 */
 			if (e->closer)
 			{
-				e->closer = CheckElementCloser(e, added, lc, procinfo, collation);
+				e->closer = CheckElementCloser(base, e, added, support);
 
 				if (!e->closer)
 					removedAny = true;
@@ -826,7 +1111,7 @@ SelectNeighbors(List *c, int m, int lc, FmgrInfo *procinfo, Oid collation, HnswE
 				 */
 				if (removedAny)
 				{
-					e->closer = CheckElementCloser(e, r, lc, procinfo, collation);
+					e->closer = CheckElementCloser(base, e, r, support);
 					if (e->closer)
 						added = lappend(added, e);
 				}
@@ -834,29 +1119,33 @@ SelectNeighbors(List *c, int m, int lc, FmgrInfo *procinfo, Oid collation, HnswE
 		}
 		else if (e == newCandidate)
 		{
-			e->closer = CheckElementCloser(e, r, lc, procinfo, collation);
+			e->closer = CheckElementCloser(base, e, r, support);
 			if (e->closer)
 				added = lappend(added, e);
 		}
 
+		/* Keep Valgrind happy for in-memory, parallel builds */
+		if (base != NULL)
+			VALGRIND_MAKE_MEM_DEFINED(&e->closer, 1);
+
 		if (e->closer)
 			r = lappend(r, e);
 		else
-			pairingheap_add(wd, &(CreatePairingHeapNode(e)->ph_node));
+			wd[wdlen++] = e;
 	}
 
 	/* Cached value can only be used in future if sorted deterministically */
-	e2->neighbors[lc].closerSet = sortCandidates;
+	*closerSet = sortCandidates;
 
 	/* Keep pruned connections */
-	while (!pairingheap_is_empty(wd) && list_length(r) < m)
-		r = lappend(r, ((HnswPairingHeapNode *) pairingheap_remove_first(wd))->inner);
+	while (wdoff < wdlen && list_length(r) < lm)
+		r = lappend(r, wd[wdoff++]);
 
 	/* Return pruned for update connections */
 	if (pruned != NULL)
 	{
-		if (!pairingheap_is_empty(wd))
-			*pruned = ((HnswPairingHeapNode *) pairingheap_first(wd))->inner;
+		if (wdoff < wdlen)
+			*pruned = wd[wdoff];
 		else
 			*pruned = linitial(w);
 	}
@@ -865,37 +1154,13 @@ SelectNeighbors(List *c, int m, int lc, FmgrInfo *procinfo, Oid collation, HnswE
 }
 
 /*
- * Find duplicate element
- */
-HnswElement
-HnswFindDuplicate(HnswElement e)
-{
-	HnswNeighborArray *neighbors = &e->neighbors[0];
-
-	for (int i = 0; i < neighbors->length; i++)
-	{
-		HnswCandidate *neighbor = &neighbors->items[i];
-
-		/* Exit early since ordered by distance */
-		if (vector_cmp_internal(e->vec, neighbor->element->vec) != 0)
-			break;
-
-		/* Check for space */
-		if (list_length(neighbor->element->heaptids) < HNSW_HEAPTIDS)
-			return neighbor->element;
-	}
-
-	return NULL;
-}
-
-/*
  * Add connections
  */
 static void
-AddConnections(HnswElement element, List *neighbors, int m, int lc)
+AddConnections(char *base, HnswElement element, List *neighbors, int lc)
 {
 	ListCell   *lc2;
-	HnswNeighborArray *a = &element->neighbors[lc];
+	HnswNeighborArray *a = HnswGetNeighbors(base, element, lc);
 
 	foreach(lc2, neighbors)
 		a->items[a->length++] = *((HnswCandidate *) lfirst(lc2));
@@ -905,18 +1170,16 @@ AddConnections(HnswElement element, List *neighbors, int m, int lc)
  * Update connections
  */
 void
-HnswUpdateConnection(HnswElement element, HnswCandidate * hc, int m, int lc, int *updateIdx, Relation index, FmgrInfo *procinfo, Oid collation)
+HnswUpdateConnection(char *base, HnswNeighborArray * neighbors, HnswElement newElement, float distance, int lm, int *updateIdx, Relation index, HnswSupport * support)
 {
-	HnswNeighborArray *currentNeighbors = &hc->element->neighbors[lc];
+	HnswCandidate newHc;
 
-	HnswCandidate hc2;
+	HnswPtrStore(base, newHc.element, newElement);
+	newHc.distance = distance;
 
-	hc2.element = element;
-	hc2.distance = hc->distance;
-
-	if (currentNeighbors->length < m)
+	if (neighbors->length < lm)
 	{
-		currentNeighbors->items[currentNeighbors->length++] = hc2;
+		neighbors->items[neighbors->length++] = newHc;
 
 		/* Track update */
 		if (updateIdx != NULL)
@@ -925,53 +1188,26 @@ HnswUpdateConnection(HnswElement element, HnswCandidate * hc, int m, int lc, int
 	else
 	{
 		/* Shrink connections */
+		List	   *c = NIL;
 		HnswCandidate *pruned = NULL;
 
-		/* Load elements on insert */
-		if (index != NULL)
-		{
-			Datum		q = PointerGetDatum(hc->element->vec);
+		/* Add candidates */
+		for (int i = 0; i < neighbors->length; i++)
+			c = lappend(c, &neighbors->items[i]);
+		c = lappend(c, &newHc);
 
-			for (int i = 0; i < currentNeighbors->length; i++)
-			{
-				HnswCandidate *hc3 = &currentNeighbors->items[i];
+		SelectNeighbors(base, c, lm, support, &neighbors->closerSet, &newHc, &pruned, true);
 
-				if (hc3->element->vec == NULL)
-					HnswLoadElement(hc3->element, &hc3->distance, &q, index, procinfo, collation, true);
-				else
-					hc3->distance = GetCandidateDistance(hc3, q, procinfo, collation);
-
-				/* Prune element if being deleted */
-				if (list_length(hc3->element->heaptids) == 0)
-				{
-					pruned = &currentNeighbors->items[i];
-					break;
-				}
-			}
-		}
-
+		/* Should not happen */
 		if (pruned == NULL)
-		{
-			List	   *c = NIL;
-
-			/* Add candidates */
-			for (int i = 0; i < currentNeighbors->length; i++)
-				c = lappend(c, &currentNeighbors->items[i]);
-			c = lappend(c, &hc2);
-
-			SelectNeighbors(c, m, lc, procinfo, collation, hc->element, &hc2, &pruned, true);
-
-			/* Should not happen */
-			if (pruned == NULL)
-				return;
-		}
+			return;
 
 		/* Find and replace the pruned element */
-		for (int i = 0; i < currentNeighbors->length; i++)
+		for (int i = 0; i < neighbors->length; i++)
 		{
-			if (currentNeighbors->items[i].element == pruned->element)
+			if (HnswPtrEqual(base, neighbors->items[i].element, pruned->element))
 			{
-				currentNeighbors->items[i] = hc2;
+				neighbors->items[i] = newHc;
 
 				/* Track update */
 				if (updateIdx != NULL)
@@ -987,20 +1223,24 @@ HnswUpdateConnection(HnswElement element, HnswCandidate * hc, int m, int lc, int
  * Remove elements being deleted or skipped
  */
 static List *
-RemoveElements(List *w, HnswElement skipElement)
+RemoveElements(char *base, List *w, HnswElement skipElement)
 {
 	ListCell   *lc2;
 	List	   *w2 = NIL;
 
+	/* Ensure does not access heaptidsLength during in-memory build */
+	pg_memory_barrier();
+
 	foreach(lc2, w)
 	{
 		HnswCandidate *hc = (HnswCandidate *) lfirst(lc2);
+		HnswElement hce = HnswPtrAccess(base, hc->element);
 
 		/* Skip self for vacuuming update */
-		if (skipElement != NULL && hc->element->blkno == skipElement->blkno && hc->element->offno == skipElement->offno)
+		if (skipElement != NULL && hce->blkno == skipElement->blkno && hce->offno == skipElement->offno)
 			continue;
 
-		if (list_length(hc->element->heaptids) != 0)
+		if (hce->heaptidsLength != 0)
 			w2 = lappend(w2, hc);
 	}
 
@@ -1008,30 +1248,53 @@ RemoveElements(List *w, HnswElement skipElement)
 }
 
 /*
+ * Precompute hash
+ */
+static void
+PrecomputeHash(char *base, HnswElement element)
+{
+	HnswElementPtr ptr;
+
+	HnswPtrStore(base, ptr, element);
+
+	if (base == NULL)
+		element->hash = hash_pointer((uintptr_t) HnswPtrPointer(ptr));
+	else
+		element->hash = hash_offset(HnswPtrOffset(ptr));
+}
+
+/*
  * Algorithm 1 from paper
  */
 void
-HnswInsertElement(HnswElement element, HnswElement entryPoint, Relation index, FmgrInfo *procinfo, Oid collation, int m, int efConstruction, bool existing)
+HnswFindElementNeighbors(char *base, HnswElement element, HnswElement entryPoint, Relation index, HnswSupport * support, int m, int efConstruction, bool existing)
 {
 	List	   *ep;
 	List	   *w;
 	int			level = element->level;
 	int			entryLevel;
-	Datum		q = PointerGetDatum(element->vec);
+	HnswQuery	q;
 	HnswElement skipElement = existing ? element : NULL;
+	bool		inMemory = index == NULL;
+
+	q.value = HnswGetValue(base, element);
+
+	/* Precompute hash */
+	if (inMemory)
+		PrecomputeHash(base, element);
 
 	/* No neighbors if no entry point */
 	if (entryPoint == NULL)
 		return;
 
 	/* Get entry point and level */
-	ep = list_make1(HnswEntryCandidate(entryPoint, q, index, procinfo, collation, true));
+	ep = list_make1(HnswEntryCandidate(base, entryPoint, &q, index, support, true));
 	entryLevel = entryPoint->level;
 
 	/* 1st phase: greedy search to insert level */
 	for (int lc = entryLevel; lc >= level + 1; lc--)
 	{
-		w = HnswSearchLayer(q, ep, 1, lc, index, procinfo, collation, m, true, skipElement);
+		w = HnswSearchLayer(base, &q, ep, 1, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
 		ep = w;
 	}
 
@@ -1047,26 +1310,113 @@ HnswInsertElement(HnswElement element, HnswElement entryPoint, Relation index, F
 	{
 		int			lm = HnswGetLayerM(m, lc);
 		List	   *neighbors;
-		List	   *lw;
+		List	   *lw = NIL;
+		ListCell   *lc2;
 
-		w = HnswSearchLayer(q, ep, efConstruction, lc, index, procinfo, collation, m, true, skipElement);
+		w = HnswSearchLayer(base, &q, ep, efConstruction, lc, index, support, m, true, skipElement, NULL, NULL, true, NULL);
+
+		/* Convert search candidates to candidates */
+		foreach(lc2, w)
+		{
+			HnswSearchCandidate *sc = lfirst(lc2);
+			HnswCandidate *hc = palloc(sizeof(HnswCandidate));
+
+			hc->element = sc->element;
+			hc->distance = sc->distance;
+
+			lw = lappend(lw, hc);
+		}
 
 		/* Elements being deleted or skipped can help with search */
 		/* but should be removed before selecting neighbors */
-		if (index != NULL)
-			lw = RemoveElements(w, skipElement);
-		else
-			lw = w;
+		if (!inMemory)
+			lw = RemoveElements(base, lw, skipElement);
 
 		/*
 		 * Candidates are sorted, but not deterministically. Could set
 		 * sortCandidates to true for in-memory builds to enable closer
 		 * caching, but there does not seem to be a difference in performance.
 		 */
-		neighbors = SelectNeighbors(lw, lm, lc, procinfo, collation, element, NULL, NULL, false);
+		neighbors = SelectNeighbors(base, lw, lm, support, &HnswGetNeighbors(base, element, lc)->closerSet, NULL, NULL, false);
 
-		AddConnections(element, neighbors, lm, lc);
+		AddConnections(base, element, neighbors, lc);
 
 		ep = w;
 	}
 }
+
+PGDLLEXPORT Datum l2_normalize(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum halfvec_l2_normalize(PG_FUNCTION_ARGS);
+PGDLLEXPORT Datum sparsevec_l2_normalize(PG_FUNCTION_ARGS);
+
+static void
+SparsevecCheckValue(Pointer v)
+{
+	SparseVector *vec = (SparseVector *) v;
+
+	if (vec->nnz > HNSW_MAX_NNZ)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("sparsevec cannot have more than %d non-zero elements for hnsw index", HNSW_MAX_NNZ)));
+}
+
+/*
+ * Get type info
+ */
+const		HnswTypeInfo *
+HnswGetTypeInfo(Relation index)
+{
+	FmgrInfo   *procinfo = HnswOptionalProcInfo(index, HNSW_TYPE_INFO_PROC);
+
+	if (procinfo == NULL)
+	{
+		static const HnswTypeInfo typeInfo = {
+			.maxDimensions = HNSW_MAX_DIM,
+			.normalize = l2_normalize,
+			.checkValue = NULL
+		};
+
+		return (&typeInfo);
+	}
+	else
+		return (const HnswTypeInfo *) DatumGetPointer(FunctionCall0Coll(procinfo, InvalidOid));
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_halfvec_support);
+Datum
+hnsw_halfvec_support(PG_FUNCTION_ARGS)
+{
+	static const HnswTypeInfo typeInfo = {
+		.maxDimensions = HNSW_MAX_DIM * 2,
+		.normalize = halfvec_l2_normalize,
+		.checkValue = NULL
+	};
+
+	PG_RETURN_POINTER(&typeInfo);
+};
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_bit_support);
+Datum
+hnsw_bit_support(PG_FUNCTION_ARGS)
+{
+	static const HnswTypeInfo typeInfo = {
+		.maxDimensions = HNSW_MAX_DIM * 32,
+		.normalize = NULL,
+		.checkValue = NULL
+	};
+
+	PG_RETURN_POINTER(&typeInfo);
+};
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(hnsw_sparsevec_support);
+Datum
+hnsw_sparsevec_support(PG_FUNCTION_ARGS)
+{
+	static const HnswTypeInfo typeInfo = {
+		.maxDimensions = SPARSEVEC_MAX_DIM,
+		.normalize = sparsevec_l2_normalize,
+		.checkValue = SparsevecCheckValue
+	};
+
+	PG_RETURN_POINTER(&typeInfo);
+};
