@@ -69,8 +69,12 @@ CREATE FUNCTION vector_sub(vector, vector) RETURNS vector
 CREATE FUNCTION vector_mul(vector, vector) RETURNS vector
 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
+<<<<<<< HEAD
 CREATE FUNCTION vector_concat(vector, vector) RETURNS vector
 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+=======
+-- private functions
+>>>>>>> Add pgvector extension to CloudBerry
 
 CREATE FUNCTION vector_lt(vector, vector) RETURNS bool
 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
@@ -129,7 +133,11 @@ CREATE AGGREGATE sum(vector) (
 	PARALLEL = SAFE
 );
 
+<<<<<<< HEAD
 -- vector cast functions
+=======
+-- cast functions
+>>>>>>> Add pgvector extension to CloudBerry
 
 CREATE FUNCTION vector(vector, integer, boolean) RETURNS vector
 	AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
@@ -209,6 +217,11 @@ CREATE OPERATOR || (
 	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_concat
 );
 
+CREATE OPERATOR * (
+	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_mul,
+	COMMUTATOR = *
+);
+
 CREATE OPERATOR < (
 	LEFTARG = vector, RIGHTARG = vector, PROCEDURE = vector_lt,
 	COMMUTATOR = > , NEGATOR = >= ,
@@ -261,6 +274,7 @@ CREATE ACCESS METHOD hnsw TYPE INDEX HANDLER hnswhandler;
 
 COMMENT ON ACCESS METHOD hnsw IS 'hnsw index access method';
 
+<<<<<<< HEAD
 -- access method private functions
 
 CREATE FUNCTION ivfflat_halfvec_support(internal) RETURNS internal
@@ -279,6 +293,9 @@ CREATE FUNCTION hnsw_sparsevec_support(internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C;
 
 -- vector opclasses
+=======
+-- opclasses
+>>>>>>> Add pgvector extension to CloudBerry
 
 CREATE OPERATOR CLASS vector_ops
 	DEFAULT FOR TYPE vector USING btree AS
@@ -325,6 +342,7 @@ CREATE OPERATOR CLASS vector_cosine_ops
 	OPERATOR 1 <=> (vector, vector) FOR ORDER BY float_ops,
 	FUNCTION 1 vector_negative_inner_product(vector, vector),
 	FUNCTION 2 vector_norm(vector);
+<<<<<<< HEAD
 
 CREATE OPERATOR CLASS vector_l1_ops
 	FOR TYPE vector USING hnsw AS
@@ -916,3 +934,5 @@ CREATE OPERATOR CLASS sparsevec_l1_ops
 	OPERATOR 1 <+> (sparsevec, sparsevec) FOR ORDER BY float_ops,
 	FUNCTION 1 l1_distance(sparsevec, sparsevec),
 	FUNCTION 3 hnsw_sparsevec_support(internal);
+=======
+>>>>>>> Add pgvector extension to CloudBerry
