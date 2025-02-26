@@ -18,7 +18,7 @@ Compile and install the extension (supports Postgres 11+)
 
 ```sh
 cd /tmp
-git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git
+git clone https://github.com/cloudberry-contrib/pgvector.git
 cd pgvector
 make
 make install # may need sudo
