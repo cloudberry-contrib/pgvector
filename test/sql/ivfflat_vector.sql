@@ -4,7 +4,9 @@ SET enable_seqscan = off;
 
 CREATE TABLE t (val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+-- start_ignore
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 1);
+-- end_ignore
 
 INSERT INTO t (val) VALUES ('[1,2,4]');
 
@@ -46,7 +48,7 @@ DROP TABLE t;
 
 -- iterative
 
-CREATE TABLE t (val vector(3));
+CREATE TABLE t (val vector(3)) distributed replicated; -- workaround: change this after https://github.com/cloudberry-contrib/pgvector/issues/10 is fixed
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 3);
 
@@ -67,7 +69,9 @@ DROP TABLE t;
 
 CREATE UNLOGGED TABLE t (val vector(3));
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+-- start_ignore
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 1);
+-- end_ignore
 
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
 

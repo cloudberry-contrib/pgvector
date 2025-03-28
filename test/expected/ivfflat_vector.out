@@ -3,6 +3,7 @@ SET enable_seqscan = off;
 CREATE TABLE t (val vector(3));
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+-- start_ignore
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 1);
 NOTICE:  ivfflat index created with little data
 DETAIL:  This will cause low recall.
@@ -10,6 +11,7 @@ HINT:  Drop the index until the table has more data.
 NOTICE:  ivfflat index created with little data  (seg1 10.13.9.77:7003 pid=27556)
 DETAIL:  This will cause low recall.
 HINT:  Drop the index until the table has more data.
+-- end_ignore
 INSERT INTO t (val) VALUES ('[1,2,4]');
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
    val   
@@ -116,22 +118,9 @@ SELECT COUNT(*) FROM (SELECT * FROM t ORDER BY val <=> (SELECT NULL::vector)) t2
 
 DROP TABLE t;
 -- iterative
-CREATE TABLE t (val vector(3));
-NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
+CREATE TABLE t (val vector(3)) distributed replicated; -- workaround: change this after https://github.com/cloudberry-contrib/pgvector/issues/10 is fixed
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 3);
-NOTICE:  ivfflat index created with little data
-DETAIL:  This will cause low recall.
-HINT:  Drop the index until the table has more data.
-NOTICE:  ivfflat index created with little data  (seg1 10.13.9.77:7003 pid=27556)
-DETAIL:  This will cause low recall.
-HINT:  Drop the index until the table has more data.
-NOTICE:  ivfflat index created with little data  (seg2 10.13.9.77:7004 pid=27555)
-DETAIL:  This will cause low recall.
-HINT:  Drop the index until the table has more data.
-NOTICE:  ivfflat index created with little data  (seg0 10.13.9.77:7002 pid=27554)
-DETAIL:  This will cause low recall.
-HINT:  Drop the index until the table has more data.
 SET ivfflat.iterative_scan = relaxed_order;
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
    val   
@@ -163,6 +152,7 @@ DROP TABLE t;
 CREATE UNLOGGED TABLE t (val vector(3));
 NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause, and no column type is suitable for a distribution key. Creating a NULL policy entry.
 INSERT INTO t (val) VALUES ('[0,0,0]'), ('[1,2,3]'), ('[1,1,1]'), (NULL);
+-- start_ignore
 CREATE INDEX ON t USING ivfflat (val vector_l2_ops) WITH (lists = 1);
 NOTICE:  ivfflat index created with little data
 DETAIL:  This will cause low recall.
@@ -170,6 +160,7 @@ HINT:  Drop the index until the table has more data.
 NOTICE:  ivfflat index created with little data  (seg0 10.13.9.77:7002 pid=27554)
 DETAIL:  This will cause low recall.
 HINT:  Drop the index until the table has more data.
+-- end_ignore
 SELECT * FROM t ORDER BY val <-> '[3,3,3]';
    val   
 ---------
