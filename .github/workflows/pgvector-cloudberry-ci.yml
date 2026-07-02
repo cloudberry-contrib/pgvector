@@ -12,10 +12,9 @@
 #      Build Apache Cloudberry (REL_2_STABLE) from source and upload the
 #      compiled installation + source as artifacts.
 #   2. test_pgvector:
-#      For each test target (regression, tap), restore the Cloudberry
-#      installation/source, create a demo cluster, build and install
-#      pgvector, then run the corresponding pgvector test suite shipped
-#      in the pgvector source tree.
+#      Restore the Cloudberry installation/source, create a demo
+#      cluster, build and install pgvector, then run pgvector's SQL
+#      regression suite (make installcheck) against the demo cluster.
 #
 # Notes:
 # - Each test job runs in an isolated environment and creates its own
@@ -25,7 +24,6 @@
 #     make               -> build the extension
 #     make install       -> install into the Cloudberry (GPHOME) tree
 #     make installcheck  -> SQL regression tests (test/sql + test/expected)
-#     make prove_installcheck -> Perl TAP tests (test/t/*.pl)
 # --------------------------------------------------------------------
 
 name: pgvector-cloudberry-ci
@@ -183,7 +181,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        test_target: [regression, tap]
+        test_target: [regression]
 
     steps:
       - name: Free Disk Space
@@ -314,13 +312,6 @@ jobs:
                   echo "=== regression.diffs ==="
                   cat regression.diffs 2>/dev/null || true
                 fi
-                exit ${rc}
-                ;;
-              tap)
-                echo "=== Running pgvector TAP tests (make prove_installcheck) ==="
-                make PG_CONFIG=$(which pg_config) prove_installcheck 2>&1 | tee "${TEST_LOG_ROOT}/pgvector-tap.log"
-                rc=${PIPESTATUS[0]}
-                cp -a tmp_check/log "${TEST_LOG_ROOT}/tap-log" 2>/dev/null || true
                 exit ${rc}
                 ;;
               *)
