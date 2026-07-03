@@ -1,0 +1,361 @@
+# --------------------------------------------------------------------
+# GitHub Actions Workflow: pgvector for Cloudberry CI
+# --------------------------------------------------------------------
+# Description:
+#
+#   Builds Apache Cloudberry from source, packages the installation,
+#   creates a demo Cloudberry cluster, then builds, installs and tests
+#   the pgvector extension against that cluster.
+#
+# Workflow Overview:
+#   1. build_cloudberry:
+#      Build Apache Cloudberry (REL_2_STABLE) from source and upload the
+#      compiled installation + source as artifacts.
+#   2. test_pgvector:
+#      Restore the Cloudberry installation/source, create a demo
+#      cluster, build and install pgvector, then run pgvector's SQL
+#      regression suite (make installcheck) against the demo cluster.
+#
+# Notes:
+# - Each test job runs in an isolated environment and creates its own
+#   demo cluster.
+# - Artifacts are used to avoid rebuilding Cloudberry for every target.
+# - pgvector uses the PGXS build system:
+#     make               -> build the extension
+#     make install       -> install into the Cloudberry (GPHOME) tree
+#     make installcheck  -> SQL regression tests (test/sql + test/expected)
+# --------------------------------------------------------------------
+
+name: pgvector-cloudberry-ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CLOUDBERRY_REPO: apache/cloudberry
+  # Currently targeting REL_2_STABLE (2.x) branch only.
+  # TODO: Switch to "main" once Cloudberry 3.x / main stabilizes.
+  CLOUDBERRY_REF: REL_2_STABLE
+  CLOUDBERRY_DIR: cloudberry
+  PGVECTOR_DIR: pgvector
+
+jobs:
+  build_cloudberry:
+    name: Build Cloudberry From Source
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --user root
+        -h cdw
+        -v /usr/share:/host_usr_share
+        -v /usr/local:/host_usr_local
+        -v /opt:/host_opt
+
+    steps:
+      - name: Free Disk Space
+        run: |
+          set -euo pipefail
+          echo "=== Disk space before cleanup ==="
+          df -h /
+
+          rm -rf /host_opt/hostedtoolcache || true
+          rm -rf /host_usr_local/lib/android || true
+          rm -rf /host_usr_share/dotnet || true
+          rm -rf /host_opt/ghc || true
+          rm -rf /host_usr_local/.ghcup || true
+          rm -rf /host_usr_share/swift || true
+          rm -rf /host_usr_local/share/powershell || true
+          rm -rf /host_usr_local/share/chromium || true
+          rm -rf /host_usr_share/miniconda || true
+          rm -rf /host_opt/az || true
+          rm -rf /host_usr_share/sbt || true
+
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
+      - name: Checkout Cloudberry Source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CLOUDBERRY_REPO }}
+          ref: ${{ env.CLOUDBERRY_REF }}
+          fetch-depth: 1
+          submodules: true
+          path: ${{ env.CLOUDBERRY_DIR }}
+
+      - name: Cloudberry Environment Initialization
+        env:
+          SRC_DIR: ${{ github.workspace }}/${{ env.CLOUDBERRY_DIR }}
+        run: |
+          set -euo pipefail
+          if ! su - gpadmin -c "/tmp/init_system.sh"; then
+            echo "::error::Container initialization failed"
+            exit 1
+          fi
+
+          mkdir -p "${SRC_DIR}/build-logs/details"
+          chown -R gpadmin:gpadmin .
+          chmod -R 755 .
+          chmod 777 "${SRC_DIR}/build-logs"
+          df -h /
+          rm -rf /__t/*
+          df -h /
+
+      - name: Configure Cloudberry
+        env:
+          SRC_DIR: ${{ github.workspace }}/${{ env.CLOUDBERRY_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x "${SRC_DIR}/devops/build/automation/cloudberry/scripts/configure-cloudberry.sh"
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/configure-cloudberry.sh"; then
+            echo "::error::Configure script failed"
+            exit 1
+          fi
+
+      - name: Build Cloudberry
+        env:
+          SRC_DIR: ${{ github.workspace }}/${{ env.CLOUDBERRY_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x "${SRC_DIR}/devops/build/automation/cloudberry/scripts/build-cloudberry.sh"
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/build-cloudberry.sh"; then
+            echo "::error::Build script failed"
+            exit 1
+          fi
+
+      - name: Package Cloudberry Source
+        env:
+          SRC_DIR: ${{ github.workspace }}/${{ env.CLOUDBERRY_DIR }}
+        run: |
+          set -euo pipefail
+          tar -C "${GITHUB_WORKSPACE}" -czf cloudberry-src.tgz "${CLOUDBERRY_DIR}"
+
+      - name: Package Cloudberry Installation
+        run: |
+          set -euo pipefail
+          tar -C /usr/local -czf cloudberry-db.tgz cloudberry-db
+
+      - name: Upload Cloudberry Installation
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudberry-db-install
+          path: cloudberry-db.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Cloudberry Source
+        uses: actions/upload-artifact@v4
+        with:
+          name: cloudberry-source
+          path: cloudberry-src.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  test_pgvector:
+    name: pgvector Tests (${{ matrix.test_target }})
+    needs: [build_cloudberry]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --user root
+        -h cdw
+        -v /usr/share:/host_usr_share
+        -v /usr/local:/host_usr_local
+        -v /opt:/host_opt
+
+    strategy:
+      fail-fast: false
+      matrix:
+        test_target: [regression]
+
+    steps:
+      - name: Free Disk Space
+        run: |
+          set -euo pipefail
+          echo "=== Disk space before cleanup ==="
+          df -h /
+
+          rm -rf /host_opt/hostedtoolcache || true
+          rm -rf /host_usr_local/lib/android || true
+          rm -rf /host_usr_share/dotnet || true
+          rm -rf /host_opt/ghc || true
+          rm -rf /host_usr_local/.ghcup || true
+          rm -rf /host_usr_share/swift || true
+          rm -rf /host_usr_local/share/powershell || true
+          rm -rf /host_usr_local/share/chromium || true
+          rm -rf /host_usr_share/miniconda || true
+          rm -rf /host_opt/az || true
+          rm -rf /host_usr_share/sbt || true
+
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
+      - name: Checkout pgvector
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: ${{ env.PGVECTOR_DIR }}
+
+      - name: Download Cloudberry Installation
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudberry-db-install
+
+      - name: Download Cloudberry Source
+        uses: actions/download-artifact@v4
+        with:
+          name: cloudberry-source
+
+      - name: Restore Cloudberry Installation
+        run: |
+          set -euo pipefail
+          tar -C /usr/local -xzf cloudberry-db.tgz
+
+      - name: Restore Cloudberry Source
+        run: |
+          set -euo pipefail
+          tar -C "${GITHUB_WORKSPACE}" -xzf cloudberry-src.tgz
+
+      - name: Cloudberry Environment Initialization
+        env:
+          SRC_DIR: ${{ github.workspace }}/${{ env.CLOUDBERRY_DIR }}
+        run: |
+          set -euo pipefail
+          if ! su - gpadmin -c "/tmp/init_system.sh"; then
+            echo "::error::Container initialization failed"
+            exit 1
+          fi
+
+          mkdir -p "${SRC_DIR}/build-logs/details"
+          chown -R gpadmin:gpadmin .
+          chmod -R 755 .
+          chmod 777 "${SRC_DIR}/build-logs"
+          df -h /
+          rm -rf /__t/*
+          df -h /
+
+      - name: Create Cloudberry Demo Cluster
+        env:
+          SRC_DIR: ${{ github.workspace }}/${{ env.CLOUDBERRY_DIR }}
+        run: |
+          set -euo pipefail
+          chmod +x "${SRC_DIR}/devops/build/automation/cloudberry/scripts/create-cloudberry-demo-cluster.sh"
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/create-cloudberry-demo-cluster.sh"; then
+            echo "::error::Demo cluster creation failed"
+            exit 1
+          fi
+
+      - name: pgvector Tests
+        env:
+          PGVECTOR_SRC: ${{ github.workspace }}/${{ env.PGVECTOR_DIR }}
+          CLOUDBERRY_SRC: ${{ github.workspace }}/${{ env.CLOUDBERRY_DIR }}
+          TEST_TARGET: ${{ matrix.test_target }}
+        run: |
+          set -euo pipefail
+          TEST_LOG_ROOT="${GITHUB_WORKSPACE}/test-logs/${TEST_TARGET}"
+          mkdir -p "${TEST_LOG_ROOT}"
+          chown -R gpadmin:gpadmin "${TEST_LOG_ROOT}"
+          # pgvector build + regression tests write into the source tree.
+          chown -R gpadmin:gpadmin "${PGVECTOR_SRC}"
+
+          cat <<'SCRIPT' > /tmp/run_pgvector_tests.sh
+          #!/bin/bash
+          set -euo pipefail
+
+          # Load Cloudberry runtime + demo-cluster environment. This puts
+          # the Cloudberry pg_config on PATH and sets PGPORT / PGHOST etc.
+          source /usr/local/cloudberry-db/cloudberry-env.sh
+          source ${CLOUDBERRY_SRC}/gpAux/gpdemo/gpdemo-env.sh
+
+          echo "=== Environment ==="
+          echo "GPHOME=${GPHOME}"
+          echo "PGPORT=${PGPORT:-<unset>}"
+          which pg_config
+          pg_config --version
+
+          pushd ${PGVECTOR_SRC}
+            echo "=== Building pgvector ==="
+            make clean 2>&1 | tee "${TEST_LOG_ROOT}/pgvector-clean.log" || true
+            # Build against Cloudberry's pg_config (resolved from PATH).
+            make PG_CONFIG=$(which pg_config) 2>&1 | tee "${TEST_LOG_ROOT}/pgvector-build.log"
+
+            echo "=== Installing pgvector ==="
+            make PG_CONFIG=$(which pg_config) install 2>&1 | tee "${TEST_LOG_ROOT}/pgvector-install.log"
+
+            set +e
+            case "${TEST_TARGET}" in
+              regression)
+                echo "=== Running pgvector regression tests (make installcheck) ==="
+                # pg_regress connects to the running demo cluster via PG* env vars.
+                make PG_CONFIG=$(which pg_config) installcheck 2>&1 | tee "${TEST_LOG_ROOT}/pgvector-installcheck.log"
+                rc=${PIPESTATUS[0]}
+                # Preserve regression diffs / results for debugging.
+                cp -a regression.diffs "${TEST_LOG_ROOT}/regression.diffs" 2>/dev/null || true
+                cp -a regression.out "${TEST_LOG_ROOT}/regression.out" 2>/dev/null || true
+                cp -a results "${TEST_LOG_ROOT}/results" 2>/dev/null || true
+                if [ "${rc}" -ne 0 ]; then
+                  echo "=== regression.diffs ==="
+                  cat regression.diffs 2>/dev/null || true
+                fi
+                # Collect Cloudberry coordinator logs for post-mortem
+                # debugging. COORDINATOR_DATA_DIRECTORY is set by the
+                # gpdemo-env.sh sourced at the top of this script.
+                if [ -n "${COORDINATOR_DATA_DIRECTORY:-}" ] && [ -d "${COORDINATOR_DATA_DIRECTORY}/log" ]; then
+                  cp -a "${COORDINATOR_DATA_DIRECTORY}/log" "${TEST_LOG_ROOT}/gpdb-log" || true
+                fi
+                exit ${rc}
+                ;;
+              *)
+                echo "unknown test target: ${TEST_TARGET}"
+                exit 2
+                ;;
+            esac
+            test_status=${PIPESTATUS[0]}
+            set -e
+          popd
+
+          exit ${test_status}
+          SCRIPT
+
+          chmod +x /tmp/run_pgvector_tests.sh
+          set +e
+          su - gpadmin -c "TEST_LOG_ROOT=${TEST_LOG_ROOT} PGVECTOR_SRC=${PGVECTOR_SRC} CLOUDBERRY_SRC=${CLOUDBERRY_SRC} TEST_TARGET=${TEST_TARGET} /tmp/run_pgvector_tests.sh"
+          status=$?
+          set -e
+
+          {
+            echo "## pgvector Test Summary"
+            echo "- Target: ${TEST_TARGET}"
+            if [ ${status} -eq 0 ]; then
+              echo "- Result: PASS"
+            else
+              echo "- Result: FAIL"
+            fi
+            echo "- Logs: ${TEST_LOG_ROOT}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          exit ${status}
+
+      - name: Upload Test Logs (On Failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-logs-${{ matrix.test_target }}
+          path: test-logs/${{ matrix.test_target }}
+          if-no-files-found: warn
+          retention-days: 7
