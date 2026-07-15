@@ -934,8 +934,14 @@ AssignTuples(IvfflatBuildState * buildstate)
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE, PROGRESS_IVFFLAT_PHASE_ASSIGN);
 
-	/* Calculate parallel workers */
-	if (buildstate->heap != NULL)
+	/*
+	 * Follow index_build(): parallel workers launched on the QD inherit
+	 * QE-only interconnect state (ic_htab_size, numsegmentsFromQD) that is
+	 * unset in a dispatcher backend, so disable parallelism on the QD and
+	 * for AO tables just like the core btree build path does.
+	 */
+	if (buildstate->heap != NULL && Gp_role != GP_ROLE_DISPATCH &&
+		!AMHandlerIsAO(buildstate->heap->rd_amhandler))
 		parallel_workers = plan_create_index_workers(RelationGetRelid(buildstate->heap), RelationGetRelid(buildstate->index));
 
 	/* Attempt to launch parallel worker scan when required */

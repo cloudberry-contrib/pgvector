@@ -45,6 +45,7 @@
 #include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/pg_type_d.h"
+#include "cdb/cdbvars.h"
 #include "commands/progress.h"
 #include "hnsw.h"
 #include "miscadmin.h"
@@ -1036,6 +1037,15 @@ static int
 ComputeParallelWorkers(Relation heap, Relation index)
 {
 	int			parallel_workers;
+
+	/*
+	 * Follow index_build(): parallel workers launched on the QD inherit
+	 * QE-only interconnect state (ic_htab_size, numsegmentsFromQD) that is
+	 * unset in a dispatcher backend, so disable parallelism on the QD and
+	 * for AO tables just like the core btree build path does.
+	 */
+	if (Gp_role == GP_ROLE_DISPATCH || AMHandlerIsAO(heap->rd_amhandler))
+		return 0;
 
 	/* Make sure it's safe to use parallel workers */
 	parallel_workers = plan_create_index_workers(RelationGetRelid(heap), RelationGetRelid(index));
